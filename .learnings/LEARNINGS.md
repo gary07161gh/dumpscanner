@@ -105,3 +105,39 @@ After editing any `.opencode/agents/*.md` file run `opencode reload; Start-Sleep
 - Last-Seen: 2026-10-15
 
 ---
+
+## [LRN-20261015-004] knowledge_gap
+
+**Logged**: 2026-10-15T15:42:00Z  
+**Priority**: low  
+**Status**: new  
+**Area**: docs  
+
+### Summary
+Exact line-number citations inside the scanner-maintainer agent prompt silently drifted after later code changes to `backend/dump DVS scanner.py`; cite symbols, not line numbers.
+
+### Details
+The scanner-maintainer agent's own operational test (dispatched read-only) refused to trust the line numbers embedded in its prompt and re-read the source, finding them stale. Re-verified by grep on 2026-10-15:
+- Cited 945 → actual **1151**: `field_names = ["timestamp_utc", ...] + [f.name for f in fields(DumpCandidate)]`
+- Cited 966–970 → actual **1176**: `CANDIDATE_LOG_PATH.replace(archive)`
+- Cited 512 → actual **717**: `prev_active_ids = ...`
+- Cited 515 → actual **720**: `if was_fast and ... not in prev_active_ids ...`
+- Cited 437 → actual **642**: `self.last_evaluated_low_times.clear()`
+- Still exact: `website/dvs_webapp.py:51` (`spec_from_file_location`), `:61` (`ENGINE =`), `backend/dvs_backtest.py:51` (`REQUIRED_COLUMNS`)
+- Not re-verified: `asdict(c)` (cited 984), `parse_args` (cited 1085–1088), `ThreadingHTTPServer` (cited 1236), webapp `sys.path` insert (cited 41)
+
+The traps themselves still hold — only the pointers rotted. The likely cause is code growth in the scanner (e.g., the GE-client addition) after the prompt was authored.
+
+### Suggested Action
+Anchor behavioral claims to symbol names (`field_names =`, `CANDIDATE_LOG_PATH.replace`) rather than line numbers, and re-grep before quoting any `.py` line reference. Refresh the stale references in `.opencode/agents/scanner-maintainer.md` (and any doc citing scanner line numbers).
+
+### Metadata
+- Source: conversation
+- Related Files: [.opencode/agents/scanner-maintainer.md](file:///c:/Users/Gary0/Downloads/dump%20finder/.opencode/agents/scanner-maintainer.md), [dump DVS scanner.py](file:///c:/Users/Gary0/Downloads/dump%20finder/backend/dump%20DVS%20scanner.py)
+- Tags: documentation, line-references, drift, silent-failure, agent-prompt
+- Pattern-Key: docs.line_refs_drift_after_code_growth
+- Recurrence-Count: 1
+- First-Seen: 2026-10-15
+- Last-Seen: 2026-10-15
+
+---
