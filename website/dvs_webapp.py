@@ -25,9 +25,18 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+BACKEND_DIR = PROJECT_ROOT / "backend"
 
-# Dynamically import "dump DVS scanner.py"
-scanner_path = SCRIPT_DIR / "dump DVS scanner.py"
+# Ensure backend directory is in sys.path
+for p in (BACKEND_DIR, SCRIPT_DIR):
+    if p.exists() and str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
+# Dynamically import "dump DVS scanner.py" from backend (or current dir fallback)
+scanner_path = BACKEND_DIR / "dump DVS scanner.py"
+if not scanner_path.exists():
+    scanner_path = SCRIPT_DIR / "dump DVS scanner.py"
 if not scanner_path.exists():
     raise FileNotFoundError(f"Cannot find scanner at {scanner_path}")
 
