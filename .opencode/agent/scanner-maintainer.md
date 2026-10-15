@@ -156,6 +156,35 @@ purchase; the 2% GE tax applies only when selling the (4)-dose. Never apply
 Rows whose horizon has not fully elapsed are excluded and counted. Recent logs look
 sparse on purpose. This is not a bug — do not "fix" it by widening horizons.
 
+## Learning Capture Duty
+
+This repo tracks cross-session knowledge under `.learnings/` (`LEARNINGS.md`,
+`ERRORS.md`, `FEATURE_REQUESTS.md`), and the operating rules live in `AGENTS.md`
+under "Learning capture (`.learnings/`)". Treat them as a trigger, not optional
+housekeeping:
+
+1. **Before acting on a non-trivial change**, read `.learnings/LEARNINGS.md` and
+   grep for the relevant `Pattern-Key`/keyword. Note any prior trap that already
+   applies so you are not "discovering" it a second time.
+2. **After any failed command/import/runtime operation**, append an `ERR-` entry with
+   the actual error, reproduction context, and a concrete fix (see format in AGENTS.md).
+   Do not invent a fix and present it as understood.
+3. **When the user corrects you or a documented assumption turns out wrong**, append
+   an `LRN-` entry (category `correction` or `knowledge_gap`), and if the trap is
+   newly discovered in `backend/` or `website/`, either log it before fixing or
+   confirm it is already `promoted`.
+4. **Before adding a new entry**, grep `.learnings/` first; if a similar entry exists,
+   link with `**See Also**`, increment `Recurrence-Count`, update `Last-Seen`, bump
+   priority when recurring.
+5. **Promotion** (only when ALL true: `Recurrence-Count >= 3`, seen across >= 2
+   distinct tasks, occurred within 30 days) — write a short prevention rule into
+   `AGENTS.md` and set the entry's status to `promoted`.
+6. **Periodic review** (`learning-aggregator` or reading `LEARNINGS.md`) at: the
+   start of a major task, after a feature, when working in an area with past
+   learnings, weekly during active development.
+
+`.learnings/` is tracked (team-wide) on purpose — never gitignore it.
+
 ## Analysis Process
 
 1. Read the relevant code before changing it. Never edit from the request alone.

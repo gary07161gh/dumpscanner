@@ -131,10 +131,215 @@ def build_session() -> requests.Session:
     return session
 
 
-def fetch_endpoint(session: requests.Session, endpoint: str, params: Optional[Dict] = None) -> Dict:
-    resp = session.get(f"{API_BASE}/{endpoint}", params=params, timeout=HTTP_TIMEOUT_SECONDS)
-    resp.raise_for_status()
-    return resp.json()
+# ---------------------------------------------------------------------
+# Typed API client + transient-error logging for the OSRS GE endpoints.
+# ---------------------------------------------------------------------
+LEARNINGS_ERRORS_PATH = SCRIPT_DIR.parent / ".learnings" / "ERRORS.md"
+
+
+class GEApiError(Exception):
+    """Typed error raised by the OSRS GE API client. Carries enough context
+    to distinguish a rate limit, a server outage, a malformed response, and
+    a transport failure without re-parsing the original exception text."""
+
+    def __init__(
+        self,
+        status: int,
+        endpoint: str,
+        message: str,
+        body: Optional[object] = None,
+        retry_after: Optional[int] = None,
+        retryable: bool = False,
+        cause: Optional[Exception] = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.endpoint = endpoint
+        self.message = message
+        self.body = body
+        self.retry_after = retry_after
+        self.retryable = retryable
+        self.__cause__ = cause
+
+    def is_rate_limited(self) -> bool:
+        return self.status == 429
+
+    def is_server_error(self) -> bool:
+        return 500 <= self.status < 600 or self.status == 0
+
+    def is_client_error(self) -> bool:
+        return 400 <= self.status < 500 and self.status != 429
+
+
+def _safe_json(resp: requests.Response) -> Optional[object]:
+    try:
+        return resp.json()
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _parse_retry_after(resp: requests.Response) -> Optional[int]:
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        # also accept an HTTP date
+        dt = datetime.strptime(raw, "%a, %d %b %Y %H:%M:%S GMT")
+        delay = int(dt.replace(tzinfo=timezone.utc).timestamp() - time.time())
+        return max(0, delay)
+    except ValueError:
+        return None
+
+
+_logged_transient_errors: Set[Tuple[str, str]] = set()
+_error_seq: int = 0
+
+
+def _log_transient_error(endpoint: str, kind: str, detail: str) -> None:
+    """Append one ERROR- entry to .learnings/ERRORS.md on a given
+    (endpoint, kind) combination. De-duplicates within the process so a watch
+    loop does not flood the log with one row per poll."""
+    global _error_seq
+    signature = (endpoint, kind)
+    if signature in _logged_transient_errors:
+        return
+    _logged_transient_errors.add(signature)
+
+    try:
+        if not LEARNINGS_ERRORS_PATH.exists():
+            LEARNINGS_ERRORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _error_seq += 1
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        date = datetime.now(timezone.utc).strftime("%Y%m%d")
+        entry_id = f"ERR-{date}-{_error_seq:03d}"
+        # sanitize detail for markdown
+        detail_clean = str(detail).replace("```", "'''")[:1000]
+        entry = (
+            f"\n## [{entry_id}] fetch_endpoint\n\n"
+            f"**Logged**: {ts}\n"
+            f"**Priority**: high\n"
+            f"**Status**: pending\n"
+            f"**Area**: backend\n\n"
+            f"### Summary\n"
+            f"Transient failure fetching `{endpoint}` ({kind})\n\n"
+            f"### Error\n"
+            f"```\n{detail_clean}\n```\n\n"
+            f"### Context\n"
+            f"- Operation: requests.get `{API_BASE}/{endpoint}`\n"
+            f"- Endpoint: {endpoint}\n"
+            f"- Failure kind: {kind}\n"
+            f"- Reached .learnings logging path via the GE API hardening client\n\n"
+            f"### Suggested Fix\n"
+            f"- Retries exhausted before success; verify GE endpoint health and "
+            f"treat cached mapping/timeframes as suspect if this recurs\n\n"
+            f"### Metadata\n"
+            f"- Reproducible: unknown\n"
+            f"- Related Files: backend/dump DVS scanner.py\n"
+            f"- See Also: LRN-20261015-001\n\n"
+            f"---\n"
+        )
+        with LEARNINGS_ERRORS_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except OSError:
+        # Logging must never break the scan itself.
+        pass
+
+
+def fetch_endpoint(
+    session: requests.Session,
+    endpoint: str,
+    params: Optional[Dict] = None,
+    max_retries: int = 3,
+) -> Dict:
+    """Fetch a JSON endpoint from the OSRS prices wiki, returning the parsed
+    body. Wraps transport/server/rate-limit errors in :class:`GEApiError` and
+    retries transient failures with exponential backoff. Delegates ultimate
+    transport retries to the session's mounted urllib3 adapter as well."""
+    url = f"{API_BASE}/{endpoint}"
+    last_exc: Optional[GEApiError] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = GEApiError(
+                status=0,
+                endpoint=endpoint,
+                message=f"connection failure: {exc}",
+                retryable=True,
+                cause=exc,
+            )
+            _log_transient_error(endpoint, "connection_failure", str(exc))
+            if attempt < max_retries:
+                time.sleep(min(2 ** (attempt - 1), 5))
+                continue
+            raise last_exc
+
+        body = _safe_json(resp)
+
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp)
+            delay = retry_after if retry_after is not None else min(2 ** (attempt - 1), 8)
+            last_exc = GEApiError(
+                status=429,
+                endpoint=endpoint,
+                message="rate limited (429)",
+                body=body,
+                retry_after=retry_after,
+                retryable=True,
+            )
+            _log_transient_error(endpoint, "rate_limited_429", f"HTTP 429 (Retry-After={retry_after})")
+            if attempt < max_retries:
+                time.sleep(delay)
+                continue
+            raise last_exc
+
+        if 500 <= resp.status_code < 600:
+            last_exc = GEApiError(
+                status=resp.status_code,
+                endpoint=endpoint,
+                message=f"server error HTTP {resp.status_code}",
+                body=body,
+                retryable=True,
+            )
+            _log_transient_error(endpoint, f"server_error_{resp.status_code}", f"HTTP {resp.status_code}")
+            if attempt < max_retries:
+                time.sleep(min(2 ** (attempt - 1), 5))
+                continue
+            raise last_exc
+
+        if not resp.ok:
+            # other 4xx: do not retry
+            raise GEApiError(
+                status=resp.status_code,
+                endpoint=endpoint,
+                message=f"HTTP error {resp.status_code}",
+                body=body,
+                retryable=False,
+            )
+
+        if not isinstance(body, (dict, list)):
+            raise GEApiError(
+                status=resp.status_code,
+                endpoint=endpoint,
+                message="empty/invalid JSON response",
+                body=None,
+                retryable=True,
+            )
+
+        return body
+
+    if last_exc is not None:
+        raise last_exc
+    raise GEApiError(
+        status=0,
+        endpoint=endpoint,
+        message="fetch failed without a captured error",
+        retryable=False,
+    )
 
 
 def load_mapping(session: requests.Session) -> List[Dict]:
@@ -279,7 +484,7 @@ def evaluate_still_falling(lows: List[int]) -> Tuple[bool, float]:
 def check_trend(session: requests.Session, item_id: int) -> Tuple[str, float]:
     try:
         payload = fetch_endpoint(session, "timeseries", {"timestep": "5m", "id": item_id})
-    except (requests.RequestException, ValueError):
+    except (GEApiError, requests.RequestException, ValueError):
         return "unavailable", 0.0
 
     raw_series = payload.get("data") or []
@@ -854,6 +1059,7 @@ def send_webhook_alert(
         resp.raise_for_status()
     except requests.RequestException as exc:
         print(f"Warning: webhook alert failed ({exc}).", file=sys.stderr)
+        _log_transient_error("webhook", "post_failed", str(exc))
 
 
 def format_age(timestamp_unix: int, now: float) -> str:
@@ -1110,7 +1316,7 @@ def run_scan_once(
             decant_check=decant_check,
             fast_mode=fast_mode,
         )
-    except requests.RequestException as exc:
+    except (requests.RequestException, GEApiError) as exc:
         print(f"Network error while querying the OSRS Wiki API: {exc}", file=sys.stderr)
         return None
 

@@ -73,5 +73,92 @@ Read it by passing `--log backend/dvs_candidate_log_legacy.csv` to the backtest,
 segment comparisons by vintage. The migration script is read-only on its inputs,
 deterministic, and refuses to write to the live log.
 
+## Learning capture (`.learnings/`)
+
+Durable, cross-session knowledge lives in `.learnings/` (tracked, team-wide):
+`LEARNINGS.md`, `ERRORS.md`, `FEATURE_REQUESTS.md`. Read them before starting any
+non-trivial task in this repo — `learning-aggregator` can be used to roll them up.
+
+### Logging rules (apply always, not just on request)
+
+1. **Errors:** log to `.learnings/ERRORS.md` with `ERR-YYYYMMDD-XXX` whenever a command,
+   tool call, import, or runtime operation fails. Capture the actual error, context,
+   and a concrete suggested fix. Do not invent a fix and present it as understood.
+2. **Corrections:** when the user corrects you, or you discover your knowledge was
+   outdated, log to `.learnings/LEARNINGS.md` (category `correction` or `knowledge_gap`).
+3. **Best practices / patterns:** when you find a non-obvious approach worth keeping,
+   log as `best_practice` with a stable `Pattern-Key`, `Recurrence-Count`, `First-Seen`,
+   and `Last-Seen`.
+4. **Feature requests:** log to `.learnings/FEATURE_REQUESTS.md` with `FEAT-YYYYMMDD-XXX`.
+5. Treat a "trap" discovered in `backend/` or `website/` the same way — if it isn't
+   already in `.learnings/`, either log it before fixing or confirm it is already promoted.
+
+### Recurring-pattern detection
+
+Before adding a new entry, grep `.learnings/` for the relevant keyword/`Pattern-Key`.
+If a similar entry exists:
+
+- Add `**See Also**` linking to the prior entry.
+- Increment `Recurrence-Count`; update `Last-Seen`.
+- Bump priority if the issue keeps recurring.
+
+### Promotion rule (single threshold used everywhere)
+
+A recurring pattern is promoted into project memory (`AGENTS.md`, and/or a memory file)
+only when **all three** are true:
+
+- `Recurrence-Count >= 3`
+- Seen across at least 2 distinct tasks
+- Occurred within a 30-day window
+
+Promoted entries are written as short prevention rules, not long incident write-ups, and
+the original entry gains `**Status**: promoted` plus `**Promoted**: AGENTS.md`.
+
+### Periodic review
+
+Review `.learnings/` (run `learning-aggregator` or read `LEARNINGS.md` directly):
+
+- At the start of a new major task.
+- After completing a feature.
+- When working in an area with past learnings.
+- Weekly during active development.
+
+### Git-tracking decision
+
+`.learnings/` is intentionally **tracked** (team-wide) so fixes and footguns propagate
+to every agent and contributor. Do not add it to `.gitignore`.
+
 The repo-root `dvs_candidate_log.csv` is the migration's source of truth; it is untracked
 by git now (see `.gitignore`), so copy it before discarding.
+
+## External APIs (OSRS GE)
+
+- All `prices.runescape.wiki` calls must go through `fetch_endpoint()` in
+  `backend/dump DVS scanner.py`, which returns the parsed JSON or raises
+  `GEApiError`. No bare `requests.get(...)` / `.json()` in `scan()`,
+  `refresh_baseline()`, or webapp code paths.
+- `GEApiError` carries `status`, `endpoint`, `message`, `body`, `retry_after`,
+  and `retryable`, plus `is_rate_limited()`, `is_server_error()`,
+  `is_client_error()`. Catch it by type, not by `except Exception`, when you
+  need to distinguish a rate limit (429) or server outage (5xx) from a real
+  data/contract bug.
+- Transient 429/5xx/connection failures retry with exponential backoff; the
+  first failure of each (endpoint, kind) pair is appended to
+  `.learnings/ERRORS.md` via `_log_transient_error` (de-duplicated per process).
+  Do not remove that line; it is the feed into `learning-aggregator`.
+- Transport-level retries also live in the mounted `urllib3.Retry` adapter
+  (429/500/502/503/504 with Retry-After). Application-level retries sit on
+  top and respect `Retry-After` for 429.
+- The GE client never writes to or parses CSV/log state; keep that separation —
+  changing a fetch must not affect `DumpCandidate` fields (which would archive
+  the signal log via `log_candidates()`).
+
+## Next Suggested Actions (skill convention)
+
+When wrapping up a multi-step task, code-change, or analysis, append a
+`## Suggested next actions` section per the `next-suggested-actions` skill:
+2–4 short imperative lines prefixed `→ `, each ≤ 10 words, one optional
+`(Recommended)` chip. Never hide caveats or errors in chip text. If the task is
+complete with nothing to do, emit `→ Done — no further action needed`. For
+choice-points that demand immediate selection, use the native question tool
+instead of chips.
