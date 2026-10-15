@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- OSRS DVS scanner (project-specific) ---
+# Live artifacts under backend/ ARE tracked on purpose: dvs_backtest.py reads
+# backend/timeseries_cache/ (path is Path(__file__).parent/'timeseries_cache'),
+# so untracking it would break backtesting on a fresh clone.
+#
+# The repo-ROOT copies below are pre-refactor leftovers from a stale webapp
+# process. Nothing loads them; backend/ owns every live path.
+#   /dvs_mapping_cache.json  -> byte-identical duplicate of backend/'s
+#   /timeseries_cache/       -> 12 orphaned series, 9 ids absent from backend/
+# Untracked, kept on disk (git rm --cached).
+/dvs_mapping_cache.json
+/timeseries_cache/
