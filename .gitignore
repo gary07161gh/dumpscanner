@@ -231,3 +231,5 @@ __marimo__/
 # Untracked, kept on disk (git rm --cached).
 /dvs_mapping_cache.json
 /timeseries_cache/
+/backend/timeseries_cache/
+/backend/dvs_mapping_cache.json
