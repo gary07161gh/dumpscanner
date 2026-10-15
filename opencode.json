@@ -1,0 +1,15 @@
+{
+  "mcp": {
+    "servers": {
+      "agentMemory": {
+        "type": "local",
+        "command": [
+          "node",
+          "C:\\Users\\Gary0\\Downloads\\dump finder\\.agent\\skills\\agent-memory\\out\\mcp-server\\server.js",
+          "dump-finder",
+          "C:\\Users\\Gary0\\Downloads\\dump finder"
+        ]
+      }
+    }
+  }
+}
