@@ -61,3 +61,17 @@ Stale duplicates of those three also sit at the **repo root** — nothing in the
 the scanner and backtest (no `MarketScannerEngine`, `get_pre_dump_baseline` without `_and_support`),
 writes them into `misc/`, then zips that folder to `misc/dump_finder_v2.5.zip`. Don't edit or run it
 expecting it to package current code, and don't trust a `grep` hit there over `backend/`.
+
+## Legacy signal history
+
+`backend/dvs_candidate_log_legacy.csv` holds 82 pre-refactor signals, migrated from the
+repo-root log by `backend/migrate_legacy_log.py` and stamped `scanner_version=2.5-legacy`.
+Those rows were scored by the pre-v2.7 scanner, so their `dvs` and `est_profit` are **not
+comparable** with v2.7-hybrid output — keep it a separate file. Do not merge it into
+`backend/dvs_candidate_log.csv`: that changes the live header and archives the log.
+Read it by passing `--log backend/dvs_candidate_log_legacy.csv` to the backtest, and
+segment comparisons by vintage. The migration script is read-only on its inputs,
+deterministic, and refuses to write to the live log.
+
+The repo-root `dvs_candidate_log.csv` is the migration's source of truth; it is untracked
+by git now (see `.gitignore`), so copy it before discarding.
