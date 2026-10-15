@@ -73,3 +73,35 @@ Use `data-lowtime` DOM attributes and a client-side ticker interval for all rela
 - Last-Seen: 2026-10-15
 
 ---
+
+## [LRN-20261015-003] knowledge_gap
+
+**Logged**: 2026-10-15T15:32:00Z  
+**Priority**: medium  
+**Status**: new  
+**Area**: config  
+
+### Summary
+OpenCode v2.0.29 silently drops an agent file whose frontmatter contains `model: inherit`, a named `color`, or a `tools:` list — no log warning; the agent simply never appears in `opencode debug agents`.
+
+### Details
+While configuring the `scanner-maintainer` agent (Claude-Code-style frontmatter originally at `.opencode/agent/scanner-maintainer.md`), it was absent from `opencode debug agents` while all builtins listed. Isolated with one-field-at-a-time probe files (otherwise identical native frontmatter):
+1. **Toxic fields** — any one of `model: inherit`, `color: yellow` (named color; V2 wants a six-digit hex), or `tools: ["Read", ...]` causes the whole agent file to be ignored. 3/3 probes with those fields failed to load; no WARN/ERROR appears in `~/.local/share/opencode/log/opencode.log`.
+2. **Not the directory** — `.opencode/agent/` (singular) IS discovered in v2.0.29: a native-frontmatter probe placed in the singular directory loaded fine.
+3. **Not `name:`** — `name:` alone is tolerated; the id stays filename-derived.
+4. **Reload race** — `opencode reload` returns before agent re-discovery finishes. Querying `opencode debug agents` immediately after reload showed a stale list twice (missing `scanner-maintainer` right after reload, present seconds later). Sleep ~5s before verifying.
+5. **Working native frontmatter** — `description: |` block, `mode: subagent`, `color: "#ffd600"`, ordered `permissions` allowlist; omit `model` (a subagent inherits the parent session's model); the body after `---` becomes `system`.
+
+### Suggested Action
+After editing any `.opencode/agents/*.md` file run `opencode reload; Start-Sleep -Seconds 5; opencode debug agents` and confirm the id appears. Translate Claude-Code-style frontmatter (`name`, `model: inherit`, named `color`, `tools:`) to native V2 fields instead of copying it verbatim.
+
+### Metadata
+- Source: conversation
+- Related Files: [.opencode/agents/scanner-maintainer.md](file:///c:/Users/Gary0/Downloads/dump%20finder/.opencode/agents/scanner-maintainer.md)
+- Tags: opencode, agents, config, frontmatter, silent-failure
+- Pattern-Key: opencode.agent_silent_drop_legacy_frontmatter
+- Recurrence-Count: 1
+- First-Seen: 2026-10-15
+- Last-Seen: 2026-10-15
+
+---
