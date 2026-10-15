@@ -3,6 +3,7 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,8 +18,13 @@ from typing import Counter as CounterType, Dict, List, Optional, Set, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
-VERSION = "2.7"
+VERSION = "2.7-hybrid"
 API_BASE = "https://prices.runescape.wiki/api/v1/osrs"
 HEADERS = {"User-Agent": f"DVS-Dump-Scanner/{VERSION} (Custom GE Market Flipping Tool)"}
 
@@ -50,13 +56,17 @@ KNIFE_MIN_CONTINUED_DROP_PCT = 2.0      # ...and fall at least this % across tha
 KNIFE_MAX_CHECKS = 50                   # Cap on /timeseries calls per scan
 KNIFE_BATCH_SIZE = 8                    # Concurrent batch size for short-circuiting /timeseries checks
 
-# Infrastructure parameters
-MAX_LATEST_AGE_SECONDS = 600    # Ignore /latest high/low trades older than 10 minutes
-LIVE_DUMP_MAX_AGE_SECONDS = 180 # Allow /latest low to trigger a live dump if < 3 minutes old
+# Infrastructure & Hybrid Polling Parameters
+MAX_LATEST_AGE_SECONDS = 600       # Ignore /latest high/low trades older than 10 minutes
+LIVE_DUMP_MAX_AGE_SECONDS = 180    # Allow /latest low to trigger a live dump if < 3 minutes old
 MAPPING_CACHE_TTL_SECONDS = 24 * 60 * 60
 HTTP_TIMEOUT_SECONDS = 15
-WATCH_BUCKET_SECONDS = 300      # The wiki /5m endpoint rolls over every 5 minutes
-WATCH_BOUNDARY_DELAY_SECONDS = 25  # Wait after each boundary so the new bucket is published
+WATCH_BUCKET_SECONDS = 300         # The wiki /5m endpoint rolls over every 5 minutes (300s)
+SLOW_TICK_BOUNDARY_DELAY = 12      # Wiki publishes 5m bucket ~12s after the boundary
+DEFAULT_FAST_INTERVAL_SECONDS = 30 # Default interval for fast-polling /latest loop
+
+# Potion Pattern for Decant Arbitrage Detection
+POTION_PATTERN = re.compile(r"^(.*?)\s*\(([1-4])\)$", re.IGNORECASE)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAPPING_CACHE_PATH = SCRIPT_DIR / "dvs_mapping_cache.json"
@@ -81,6 +91,15 @@ class DumpCandidate:
     raw_drop_pct: float = 0.0
     trend_check: str = "skipped"
     alch_bonus: float = 0.0
+    # Hybrid & Decant Extensions
+    low_time: int = 0
+    fail_reason: str = ""
+    is_potion: bool = False
+    potion_dose: Optional[int] = None
+    decant_target_name: Optional[str] = None
+    decant_target_price: int = 0
+    decant_roi_pct: float = 0.0
+    decant_profit: int = 0
 
 
 def calculate_ge_tax(sell_price: int) -> int:
@@ -102,7 +121,7 @@ def build_session() -> requests.Session:
         status=3,
         backoff_factor=0.75,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
+        allowed_methods=frozenset({"GET", "POST"}),
         respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16)
@@ -160,7 +179,7 @@ def fetch_snapshots(session: requests.Session) -> Tuple[List[Dict], Dict, Dict, 
 
 
 # =====================================================================
-# CORE LOGIC
+# CORE LOGIC & RECONSTRUCTION
 # =====================================================================
 def get_pre_dump_baseline_and_support(
     high_1h: int, low_1h: int, buy_1h: int, sell_1h: int, p_dump: int, sell_5m: int
@@ -222,6 +241,27 @@ def build_item_map(mapping_raw: List[Dict]) -> Dict[str, Dict]:
             "highalch": int(item.get("highalch") or 0),
         }
     return item_map
+
+
+def build_potion_registry(mapping_raw: List[Dict]) -> Dict[str, Dict[int, int]]:
+    """
+    Builds a registry mapping lower-cased potion base names to their dose variants:
+    e.g. 'prayer potion' -> {1: 143, 2: 141, 3: 139, 4: 2434}
+    """
+    registry: Dict[str, Dict[int, int]] = {}
+    for item in mapping_raw:
+        item_id = item.get("id")
+        name = item.get("name", "")
+        if not item_id or not name:
+            continue
+        m = POTION_PATTERN.match(name.strip())
+        if m:
+            base_name = m.group(1).strip().lower()
+            dose = int(m.group(2))
+            if base_name not in registry:
+                registry[base_name] = {}
+            registry[base_name][dose] = int(item_id)
+    return registry
 
 
 def evaluate_still_falling(lows: List[int]) -> Tuple[bool, float]:
@@ -335,6 +375,406 @@ def allocate_portfolio(
     return allocated
 
 
+# =====================================================================
+# TWO-SPEED HYBRID SCANNER ENGINE
+# =====================================================================
+class MarketScannerEngine:
+    """
+    Stateful engine maintaining the two-speed hybrid polling loop:
+      - Slow Loop: Refreshes /5m, /1h, /24h, /mapping every 5 minutes (synced ~12s after GE boundary).
+      - Fast Loop: Runs every 30-45s polling ONLY /latest, evaluating items with fresh trades,
+        recalculating DVS instantly against the cached 5m baseline, and triggering knife checks
+        strictly for threshold-crossing candidates.
+    """
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        self.session = session or build_session()
+        self.mapping_raw: List[Dict] = []
+        self.item_map: Dict[str, Dict] = {}
+        self.potion_registry: Dict[str, Dict[int, int]] = {}
+        self.data_5m: Dict[str, Dict] = {}
+        self.data_1h: Dict[str, Dict] = {}
+        self.data_24h: Dict[str, Dict] = {}
+        self.last_baseline_time: float = 0.0
+        self.last_baseline_bucket: int = 0
+        self.last_evaluated_low_times: Dict[str, int] = {}
+        self.cached_candidates: List[DumpCandidate] = []
+        self.cached_near_misses: List[DumpCandidate] = []
+        self.cached_funnel: CounterType[str] = Counter()
+
+    def is_baseline_stale(self, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        if not self.data_5m or not self.data_1h or not self.item_map:
+            return True
+        current_bucket = int(now) // WATCH_BUCKET_SECONDS
+        bucket_elapsed = now - (current_bucket * WATCH_BUCKET_SECONDS)
+        # If we entered a new 5-minute bucket and reached the Wiki publishing delay (~12s)
+        if current_bucket > self.last_baseline_bucket and bucket_elapsed >= SLOW_TICK_BOUNDARY_DELAY:
+            return True
+        # Or if baseline is older than 5 minutes
+        if now - self.last_baseline_time >= WATCH_BUCKET_SECONDS:
+            return True
+        return False
+
+    def refresh_baseline(self) -> None:
+        """Slow Loop: Fetches /mapping, /5m, /1h, /24h concurrently and reconstructs cache."""
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_mapping = pool.submit(load_mapping, self.session)
+            f_5m = pool.submit(fetch_endpoint, self.session, "5m")
+            f_1h = pool.submit(fetch_endpoint, self.session, "1h")
+            f_24h = pool.submit(fetch_endpoint, self.session, "24h")
+
+            self.mapping_raw = f_mapping.result()
+            self.data_5m = f_5m.result().get("data", {})
+            self.data_1h = f_1h.result().get("data", {})
+            self.data_24h = f_24h.result().get("data", {})
+
+        self.item_map = build_item_map(self.mapping_raw)
+        self.potion_registry = build_potion_registry(self.mapping_raw)
+        now = time.time()
+        self.last_baseline_time = now
+        self.last_baseline_bucket = int(now) // WATCH_BUCKET_SECONDS
+        self.last_evaluated_low_times.clear()
+
+    def scan(
+        self,
+        knife_check_enabled: bool = KNIFE_CHECK_ENABLED,
+        max_slots: Optional[int] = None,
+        bankroll: Optional[int] = None,
+        near_misses_out: Optional[List[DumpCandidate]] = None,
+        min_dvs_score: float = MIN_DVS_SCORE,
+        min_margin_pillar: float = MIN_MARGIN_PILLAR,
+        min_demand_pillar: float = MIN_DEMAND_PILLAR,
+        min_est_profit: int = MIN_EST_PROFIT,
+        max_slot_capital: Optional[int] = MAX_SLOT_CAPITAL,
+        min_raw_drop_pct: float = MIN_RAW_DROP_PCT,
+        min_support_break_pct: float = MIN_SUPPORT_BREAK_PCT,
+        min_item_price: int = MIN_ITEM_PRICE,
+        retracement_target: float = RETRACEMENT_TARGET,
+        max_recovery_fraction: float = MAX_RECOVERY_FRACTION,
+        filter_partial_potions: bool = False,
+        decant_check: bool = True,
+        force_slow: bool = False,
+        fast_mode: bool = True,
+    ) -> Tuple[List[DumpCandidate], List[DumpCandidate], CounterType[str], bool]:
+        """
+        Executes a scan pass.
+        Returns: (candidates, near_misses, funnel, was_fast_scan)
+        """
+        now = time.time()
+        was_fast = False
+
+        if force_slow or self.is_baseline_stale(now) or not fast_mode:
+            self.refresh_baseline()
+            was_fast = False
+        else:
+            was_fast = True
+
+        data_latest = fetch_endpoint(self.session, "latest").get("data", {})
+        now = time.time()
+
+        funnel: CounterType[str] = Counter()
+        candidates: List[DumpCandidate] = []
+        near_misses: List[DumpCandidate] = []
+
+        all_item_ids = set(self.data_5m.keys()) | set(self.data_1h.keys())
+
+        for item_id in all_item_ids:
+            funnel["scanned"] += 1
+            if item_id not in self.item_map:
+                funnel["rej: not in mapping / no limit / excluded"] += 1
+                continue
+            if item_id not in self.data_1h:
+                funnel["rej: no 1h data"] += 1
+                continue
+
+            meta = self.item_map[item_id]
+            item_name = meta["name"]
+
+            # Optional Partial-Dose Potion Check / Filtering
+            m_pot = POTION_PATTERN.match(item_name)
+            is_potion = bool(m_pot)
+            potion_dose = int(m_pot.group(2)) if m_pot else None
+
+            if filter_partial_potions and is_potion and potion_dose in (1, 2, 3):
+                funnel["rej: partial-dose potion ((1)-(3))"] += 1
+                continue
+
+            tick_5m = self.data_5m.get(item_id, {})
+            tick_1h = self.data_1h[item_id]
+            tick_24h = self.data_24h.get(item_id, {})
+            latest = data_latest.get(item_id, {})
+            buy_limit = meta["limit"]
+
+            low_time = latest.get("lowTime") or 0
+            high_time = latest.get("highTime") or 0
+
+            prev_active_ids = {c.item_id for c in self.cached_candidates} | {c.item_id for c in self.cached_near_misses}
+            # In fast mode: only evaluate items with new trades OR currently active candidates/near-misses
+            has_new_low = low_time > 0 and self.last_evaluated_low_times.get(item_id) != low_time
+            if was_fast and (int(item_id) not in prev_active_ids) and not has_new_low:
+                continue
+
+            self.last_evaluated_low_times[item_id] = low_time
+
+            high_24h = tick_24h.get("avgHighPrice") or 0
+            buy_24h = tick_24h.get("highPriceVolume") or 0
+
+            avg_low_5m = tick_5m.get("avgLowPrice") or 0
+            sell_5m = tick_5m.get("lowPriceVolume") or 0
+            buy_5m = tick_5m.get("highPriceVolume") or 0
+
+            latest_low = fresh_price(latest.get("low"), low_time, now)
+            latest_low_very_fresh = fresh_price(
+                latest.get("low"), low_time, now, max_age=LIVE_DUMP_MAX_AGE_SECONDS
+            )
+            latest_high = fresh_price(latest.get("high"), high_time, now)
+
+            # Allow item if it has 5m instasell volume OR a fresh live dump on /latest
+            has_5m_sell = avg_low_5m > 0 and sell_5m > 0
+            if not has_5m_sell and not latest_low_very_fresh:
+                funnel["rej: no 5m or live instasell activity"] += 1
+                continue
+
+            high_1h = tick_1h.get("avgHighPrice") or 0
+            low_1h = tick_1h.get("avgLowPrice") or 0
+            buy_1h = tick_1h.get("highPriceVolume") or 0
+            sell_1h = tick_1h.get("lowPriceVolume") or 0
+
+            if buy_1h < MIN_1H_BUY_VOLUME:
+                funnel["rej: 1h instabuy volume too low"] += 1
+                continue
+
+            if buy_limit <= 8 and buy_1h < 15:
+                funnel["rej: low-liquidity trap (limit <= 8, buy_1h < 15)"] += 1
+                continue
+
+            # Determine provisional dump price to reconstruct baseline
+            provisional_dump = (
+                min(avg_low_5m, latest_low)
+                if (has_5m_sell and latest_low)
+                else (avg_low_5m if has_5m_sell else latest_low_very_fresh)
+            )
+            effective_sell_5m = sell_5m if has_5m_sell else max(1, int(0.15 * buy_limit))
+
+            p_base, prior_low = get_pre_dump_baseline_and_support(
+                high_1h, low_1h, buy_1h, sell_1h, provisional_dump, effective_sell_5m
+            )
+            if p_base <= 0 or provisional_dump >= p_base:
+                funnel["rej: price not below baseline"] += 1
+                continue
+
+            # Check if 5m dump already bounced on /latest
+            if has_5m_sell and latest_low and latest_low > avg_low_5m:
+                if latest_low > (avg_low_5m + max_recovery_fraction * (p_base - avg_low_5m)):
+                    funnel["rej: dump already recovered on /latest"] += 1
+                    continue
+
+            p_dump = provisional_dump
+
+            if p_dump < min_item_price or (p_base - p_dump) < 2:
+                funnel["rej: penny item / 1-gp spread"] += 1
+                continue
+
+            if high_24h > 0 and buy_24h >= 20 and p_dump > int(high_24h * 1.05):
+                funnel["rej: dump price exceeds 24h high (unwinding pump)"] += 1
+                continue
+
+            if prior_low > 0:
+                support_drop_pct = ((prior_low - p_dump) / prior_low) * 100.0
+                if support_drop_pct < min_support_break_pct:
+                    funnel["rej: no 1h support break"] += 1
+                    continue
+
+            raw_drop_pct = ((p_base - p_dump) / p_base) * 100.0
+            if raw_drop_pct < min_raw_drop_pct:
+                funnel["rej: raw drop too small"] += 1
+                continue
+
+            raw_exit = int(round(p_dump + retracement_target * (p_base - p_dump)))
+            if latest_high:
+                if latest_high <= p_dump:
+                    funnel["rej: instabuy ceiling collapsed"] += 1
+                    continue
+                p_exit = min(raw_exit, latest_high - 1)
+            else:
+                p_exit = raw_exit
+
+            if high_24h > 0 and buy_24h >= 20:
+                p_exit = min(p_exit, max(p_dump + 1, int(round(high_24h * 1.02))))
+
+            tax = calculate_ge_tax(p_exit)
+            unit_profit = p_exit - tax - p_dump
+            net_roi_pct = (unit_profit / p_dump) * 100.0
+            if net_roi_pct <= 0.5 or unit_profit <= 0:
+                funnel["rej: net ROI <= 0.5%"] += 1
+                continue
+
+            m_score = min(40.0, 40.0 * ((net_roi_pct - 0.5) / 4.5))
+
+            l_sat = effective_sell_5m / buy_limit
+            if l_sat < 0.15:
+                s_score = 15.0 + (20.0 * (l_sat / 0.15))
+            elif l_sat <= 2.0:
+                s_score = 35.0
+            else:
+                s_score = 35.0 * math.exp(-0.35 * (l_sat - 2.0))
+
+            t_clear = effective_sell_5m / max(1, buy_1h)
+            b_live = buy_5m / max(1, (effective_sell_5m + buy_5m))
+            d_score = (20.0 / (1.0 + 1.5 * t_clear)) + (5.0 * b_live)
+
+            highalch = meta.get("highalch", 0)
+            alch_net = max(0, highalch - 100)
+            alch_bonus = 10.0 if (alch_net > 0 and p_dump <= int(round(alch_net * 1.01))) else 0.0
+
+            dvs = m_score + s_score + d_score + alch_bonus
+
+            half_hour_buyer_cap = max(1, int(math.floor(0.5 * buy_1h)))
+            est_fill = min(buy_limit, effective_sell_5m, half_hour_buyer_cap)
+            slot_cap_gp = (
+                min(max_slot_capital, bankroll)
+                if (max_slot_capital and bankroll)
+                else (bankroll or max_slot_capital)
+            )
+            if slot_cap_gp and p_dump > 0:
+                capital_cap = max(0, slot_cap_gp // p_dump)
+                est_fill = min(est_fill, capital_cap)
+            if est_fill <= 0:
+                funnel["rej: zero est fill (capital cap)"] += 1
+                continue
+
+            est_profit = unit_profit * est_fill
+
+            # Optional Decant Arbitrage Analysis
+            decant_target_name = None
+            decant_target_price = 0
+            decant_roi_pct = 0.0
+            decant_profit = 0
+
+            if decant_check and is_potion and potion_dose in (1, 2, 3):
+                base_name = m_pot.group(1).strip().lower()
+                four_id = self.potion_registry.get(base_name, {}).get(4)
+                if four_id and str(four_id) in self.item_map:
+                    target_meta = self.item_map[str(four_id)]
+                    decant_target_name = target_meta["name"]
+                    t_latest = data_latest.get(str(four_id), {})
+                    t_5m = self.data_5m.get(str(four_id), {})
+                    t_1h = self.data_1h.get(str(four_id), {})
+                    p_exit_4 = (
+                        t_latest.get("high")
+                        or t_5m.get("avgHighPrice")
+                        or t_1h.get("avgHighPrice")
+                        or 0
+                    )
+                    if p_exit_4 > 0 and p_dump > 0:
+                        decant_target_price = int(p_exit_4)
+                        cost_per_4 = (p_dump / potion_dose) * 4.0
+                        tax_4 = calculate_ge_tax(decant_target_price)
+                        net_4 = decant_target_price - tax_4
+                        profit_per_4 = net_4 - cost_per_4
+                        if profit_per_4 > 0:
+                            decant_roi_pct = (profit_per_4 / cost_per_4) * 100.0
+                            equiv_4 = int((est_fill * potion_dose) // 4)
+                            decant_profit = int(profit_per_4 * equiv_4)
+
+            cand_obj = DumpCandidate(
+                item_id=int(item_id),
+                name=item_name,
+                p_dump=p_dump,
+                p_exit=p_exit,
+                net_roi_pct=net_roi_pct,
+                dvs=dvs,
+                m_score=m_score,
+                s_score=s_score,
+                d_score=d_score,
+                est_fill=est_fill,
+                est_profit=est_profit,
+                status="NEAR MISS",
+                p_base=p_base,
+                raw_drop_pct=raw_drop_pct,
+                alch_bonus=alch_bonus,
+                low_time=int(low_time or now),
+                fail_reason="",
+                is_potion=is_potion,
+                potion_dose=potion_dose,
+                decant_target_name=decant_target_name,
+                decant_target_price=decant_target_price,
+                decant_roi_pct=round(decant_roi_pct, 2),
+                decant_profit=decant_profit,
+            )
+
+            # Strict Filter Evaluation with Specific Cell Failure Tagging
+            if m_score < min_margin_pillar:
+                funnel["rej: margin pillar below minimum"] += 1
+                if est_profit >= 25_000 and dvs >= 40.0:
+                    cand_obj.fail_reason = "MARGIN"
+                    near_misses.append(cand_obj)
+                continue
+
+            if d_score < min_demand_pillar:
+                funnel["rej: demand pillar below minimum"] += 1
+                if est_profit >= 25_000 and dvs >= 40.0:
+                    cand_obj.fail_reason = "DEMAND"
+                    near_misses.append(cand_obj)
+                continue
+
+            if dvs < min_dvs_score:
+                funnel["rej: DVS below minimum"] += 1
+                if est_profit >= 25_000:
+                    cand_obj.fail_reason = "DVS"
+                    near_misses.append(cand_obj)
+                continue
+
+            if est_profit < min_est_profit:
+                funnel["rej: est profit below minimum"] += 1
+                if est_profit >= 25_000:
+                    cand_obj.fail_reason = "PROFIT"
+                    near_misses.append(cand_obj)
+                continue
+
+            status_str = "STRONG BUY" if (dvs >= 75.0 and d_score >= 8.0) else "CAUTION / BUY"
+            if decant_profit >= 40_000 and decant_roi_pct >= 3.0:
+                status_str += " [DECANT]"
+            cand_obj.status = status_str
+            funnel["passed primary filters"] += 1
+            candidates.append(cand_obj)
+
+        candidates.sort(key=lambda c: (c.dvs, c.est_profit), reverse=True)
+        desired_count = min(TOP_N_RESULTS, max_slots) if max_slots else TOP_N_RESULTS
+        candidates = apply_trend_filter(
+            self.session, candidates, funnel, target_count=desired_count, enabled=knife_check_enabled
+        )
+        final = candidates[:TOP_N_RESULTS]
+        final = allocate_portfolio(
+            final, max_slots=max_slots, bankroll=bankroll, funnel=funnel, min_est_profit=min_est_profit
+        )
+        funnel["accepted"] = len(final)
+
+        near_misses.sort(key=lambda c: (c.dvs, c.est_profit), reverse=True)
+        trimmed_near_misses = near_misses[:NEAR_MISS_COUNT]
+
+        if near_misses_out is not None:
+            near_misses_out.extend(trimmed_near_misses)
+
+        self.cached_candidates = final
+        self.cached_near_misses = trimmed_near_misses
+        self.cached_funnel = funnel
+
+        return final, trimmed_near_misses, funnel, was_fast
+
+
+# Shared default engine instance
+DEFAULT_ENGINE: Optional[MarketScannerEngine] = None
+
+
+def get_default_engine(session: Optional[requests.Session] = None) -> MarketScannerEngine:
+    global DEFAULT_ENGINE
+    if DEFAULT_ENGINE is None or (session and DEFAULT_ENGINE.session != session):
+        DEFAULT_ENGINE = MarketScannerEngine(session)
+    return DEFAULT_ENGINE
+
+
 def scan_dumps(
     session: requests.Session,
     knife_check_enabled: bool = KNIFE_CHECK_ENABLED,
@@ -351,226 +791,34 @@ def scan_dumps(
     min_item_price: int = MIN_ITEM_PRICE,
     retracement_target: float = RETRACEMENT_TARGET,
     max_recovery_fraction: float = MAX_RECOVERY_FRACTION,
+    filter_partial_potions: bool = False,
+    decant_check: bool = True,
+    engine: Optional[MarketScannerEngine] = None,
+    fast_mode: bool = False,
 ) -> Tuple[List[DumpCandidate], CounterType[str]]:
-    mapping_raw, data_5m, data_1h, data_24h, data_latest = fetch_snapshots(session)
-    item_map = build_item_map(mapping_raw)
-    now = time.time()
-
-    funnel: CounterType[str] = Counter()
-    candidates: List[DumpCandidate] = []
-    near_misses: List[DumpCandidate] = []
-
-    all_item_ids = set(data_5m.keys()) | set(data_1h.keys())
-
-    for item_id in all_item_ids:
-        funnel["scanned"] += 1
-        if item_id not in item_map:
-            funnel["rej: not in mapping / no limit / excluded"] += 1
-            continue
-        if item_id not in data_1h:
-            funnel["rej: no 1h data"] += 1
-            continue
-
-        tick_5m = data_5m.get(item_id, {})
-        tick_1h = data_1h[item_id]
-        tick_24h = data_24h.get(item_id, {})
-        latest = data_latest.get(item_id, {})
-        meta = item_map[item_id]
-        buy_limit = meta["limit"]
-
-        high_24h = tick_24h.get("avgHighPrice") or 0
-        buy_24h = tick_24h.get("highPriceVolume") or 0
-
-        avg_low_5m = tick_5m.get("avgLowPrice") or 0
-        sell_5m = tick_5m.get("lowPriceVolume") or 0
-        buy_5m = tick_5m.get("highPriceVolume") or 0
-
-        latest_low = fresh_price(latest.get("low"), latest.get("lowTime"), now)
-        latest_low_very_fresh = fresh_price(
-            latest.get("low"), latest.get("lowTime"), now, max_age=LIVE_DUMP_MAX_AGE_SECONDS
-        )
-        latest_high = fresh_price(latest.get("high"), latest.get("highTime"), now)
-
-        # Allow item if it has 5m instasell volume OR a brand-new live dump on /latest
-        has_5m_sell = avg_low_5m > 0 and sell_5m > 0
-        if not has_5m_sell and not latest_low_very_fresh:
-            funnel["rej: no 5m or live instasell activity"] += 1
-            continue
-
-        high_1h = tick_1h.get("avgHighPrice") or 0
-        low_1h = tick_1h.get("avgLowPrice") or 0
-        buy_1h = tick_1h.get("highPriceVolume") or 0
-        sell_1h = tick_1h.get("lowPriceVolume") or 0
-
-        if buy_1h < MIN_1H_BUY_VOLUME:
-            funnel["rej: 1h instabuy volume too low"] += 1
-            continue
-
-        if buy_limit <= 8 and buy_1h < 15:
-            funnel["rej: low-liquidity trap (limit <= 8, buy_1h < 15)"] += 1
-            continue
-
-        # Determine provisional dump price to reconstruct baseline
-        provisional_dump = (
-            min(avg_low_5m, latest_low)
-            if (has_5m_sell and latest_low)
-            else (avg_low_5m if has_5m_sell else latest_low_very_fresh)
-        )
-        effective_sell_5m = sell_5m if has_5m_sell else max(1, int(0.15 * buy_limit))
-
-        p_base, prior_low = get_pre_dump_baseline_and_support(
-            high_1h, low_1h, buy_1h, sell_1h, provisional_dump, effective_sell_5m
-        )
-        if p_base <= 0 or provisional_dump >= p_base:
-            funnel["rej: price not below baseline"] += 1
-            continue
-
-        # Check if 5m dump already bounced on /latest (only when latest_low is NOT itself a fresh dump)
-        if has_5m_sell and latest_low and latest_low > avg_low_5m:
-            if latest_low > (avg_low_5m + max_recovery_fraction * (p_base - avg_low_5m)):
-                funnel["rej: dump already recovered on /latest"] += 1
-                continue
-
-        p_dump = provisional_dump
-
-        if p_dump < min_item_price or (p_base - p_dump) < 2:
-            funnel["rej: penny item / 1-gp spread"] += 1
-            continue
-
-        if high_24h > 0 and buy_24h >= 20 and p_dump > int(high_24h * 1.05):
-            funnel["rej: dump price exceeds 24h high (unwinding pump)"] += 1
-            continue
-
-        # Compare against reconstructed prior_low so big dumps don't contaminate their own support check
-        if prior_low > 0:
-            support_drop_pct = ((prior_low - p_dump) / prior_low) * 100.0
-            if support_drop_pct < min_support_break_pct:
-                funnel["rej: no 1h support break"] += 1
-                continue
-
-        raw_drop_pct = ((p_base - p_dump) / p_base) * 100.0
-        if raw_drop_pct < min_raw_drop_pct:
-            funnel["rej: raw drop too small"] += 1
-            continue
-
-        raw_exit = int(round(p_dump + retracement_target * (p_base - p_dump)))
-        if latest_high:
-            if latest_high <= p_dump:
-                funnel["rej: instabuy ceiling collapsed"] += 1
-                continue
-            p_exit = min(raw_exit, latest_high - 1)
-        else:
-            p_exit = raw_exit
-
-        if high_24h > 0 and buy_24h >= 20:
-            p_exit = min(p_exit, max(p_dump + 1, int(round(high_24h * 1.02))))
-
-        tax = calculate_ge_tax(p_exit)
-        unit_profit = p_exit - tax - p_dump
-        net_roi_pct = (unit_profit / p_dump) * 100.0
-        if net_roi_pct <= 0.5 or unit_profit <= 0:
-            funnel["rej: net ROI <= 0.5%"] += 1
-            continue
-
-        m_score = min(40.0, 40.0 * ((net_roi_pct - 0.5) / 4.5))
-
-        l_sat = effective_sell_5m / buy_limit
-        if l_sat < 0.15:
-            s_score = 15.0 + (20.0 * (l_sat / 0.15))
-        elif l_sat <= 2.0:
-            s_score = 35.0
-        else:
-            s_score = 35.0 * math.exp(-0.35 * (l_sat - 2.0))
-
-        t_clear = effective_sell_5m / max(1, buy_1h)
-        b_live = buy_5m / max(1, (effective_sell_5m + buy_5m))
-        d_score = (20.0 / (1.0 + 1.5 * t_clear)) + (5.0 * b_live)
-
-        highalch = meta.get("highalch", 0)
-        alch_net = max(0, highalch - 100)
-        alch_bonus = 10.0 if (alch_net > 0 and p_dump <= int(round(alch_net * 1.01))) else 0.0
-
-        dvs = m_score + s_score + d_score + alch_bonus
-
-        half_hour_buyer_cap = max(1, int(math.floor(0.5 * buy_1h)))
-        est_fill = min(buy_limit, effective_sell_5m, half_hour_buyer_cap)
-        slot_cap_gp = (
-            min(max_slot_capital, bankroll)
-            if (max_slot_capital and bankroll)
-            else (bankroll or max_slot_capital)
-        )
-        if slot_cap_gp and p_dump > 0:
-            capital_cap = max(0, slot_cap_gp // p_dump)
-            est_fill = min(est_fill, capital_cap)
-        if est_fill <= 0:
-            funnel["rej: zero est fill (capital cap)"] += 1
-            continue
-
-        est_profit = unit_profit * est_fill
-
-        cand_obj = DumpCandidate(
-            item_id=int(item_id),
-            name=meta["name"],
-            p_dump=p_dump,
-            p_exit=p_exit,
-            net_roi_pct=net_roi_pct,
-            dvs=dvs,
-            m_score=m_score,
-            s_score=s_score,
-            d_score=d_score,
-            est_fill=est_fill,
-            est_profit=est_profit,
-            status="NEAR MISS",
-            p_base=p_base,
-            raw_drop_pct=raw_drop_pct,
-            alch_bonus=alch_bonus,
-        )
-
-        # Track near misses (profitable after tax with >20k est profit) before strict pillar/DVS cuts
-        if m_score < min_margin_pillar:
-            funnel["rej: margin pillar below minimum"] += 1
-            if est_profit >= 25_000 and dvs >= 40.0:
-                near_misses.append(cand_obj)
-            continue
-
-        if d_score < min_demand_pillar:
-            funnel["rej: demand pillar below minimum"] += 1
-            if est_profit >= 25_000 and dvs >= 40.0:
-                near_misses.append(cand_obj)
-            continue
-
-        if dvs < min_dvs_score:
-            funnel["rej: DVS below minimum"] += 1
-            if est_profit >= 25_000:
-                near_misses.append(cand_obj)
-            continue
-
-        if est_profit < min_est_profit:
-            funnel["rej: est profit below minimum"] += 1
-            if est_profit >= 25_000:
-                near_misses.append(cand_obj)
-            continue
-
-        cand_obj.status = "STRONG BUY" if (dvs >= 75.0 and d_score >= 8.0) else "CAUTION / BUY"
-        funnel["passed primary filters"] += 1
-        candidates.append(cand_obj)
-
-    candidates.sort(key=lambda c: (c.dvs, c.est_profit), reverse=True)
-    desired_count = min(TOP_N_RESULTS, max_slots) if max_slots else TOP_N_RESULTS
-    candidates = apply_trend_filter(
-        session, candidates, funnel, target_count=desired_count, enabled=knife_check_enabled
+    """Backward-compatible entry point that delegates to the MarketScannerEngine."""
+    eng = engine or get_default_engine(session)
+    cands, _nms, funnel, _was_fast = eng.scan(
+        knife_check_enabled=knife_check_enabled,
+        max_slots=max_slots,
+        bankroll=bankroll,
+        near_misses_out=near_misses_out,
+        min_dvs_score=min_dvs_score,
+        min_margin_pillar=min_margin_pillar,
+        min_demand_pillar=min_demand_pillar,
+        min_est_profit=min_est_profit,
+        max_slot_capital=max_slot_capital,
+        min_raw_drop_pct=min_raw_drop_pct,
+        min_support_break_pct=min_support_break_pct,
+        min_item_price=min_item_price,
+        retracement_target=retracement_target,
+        max_recovery_fraction=max_recovery_fraction,
+        filter_partial_potions=filter_partial_potions,
+        decant_check=decant_check,
+        force_slow=not fast_mode,
+        fast_mode=fast_mode,
     )
-    final = candidates[:TOP_N_RESULTS]
-    final = allocate_portfolio(
-        final, max_slots=max_slots, bankroll=bankroll, funnel=funnel, min_est_profit=min_est_profit
-    )
-    funnel["accepted"] = len(final)
-
-    if near_misses_out is not None:
-        near_misses.sort(key=lambda c: (c.dvs, c.est_profit), reverse=True)
-        near_misses_out.extend(near_misses[:NEAR_MISS_COUNT])
-
-    return final, funnel
+    return cands, funnel
 
 
 # =====================================================================
@@ -608,17 +856,30 @@ def send_webhook_alert(
         print(f"Warning: webhook alert failed ({exc}).", file=sys.stderr)
 
 
+def format_age(timestamp_unix: int, now: float) -> str:
+    if not timestamp_unix or timestamp_unix <= 0:
+        return "--"
+    age = max(0, int(now - timestamp_unix))
+    if age < 60:
+        return f"{age}s ago"
+    minutes = age // 60
+    return f"{minutes}m ago"
+
+
 def print_report(
     candidates: List[DumpCandidate],
     new_ids: Optional[Set[int]] = None,
     near_misses: Optional[List[DumpCandidate]] = None,
+    was_fast: bool = False,
 ) -> None:
-    width = 120
+    now = time.time()
+    width = 132
     print("=" * width)
-    print(f"OSRS DUMP VULNERABILITY SCORE (DVS) SCANNER v{VERSION}".center(width))
+    mode_tag = "[FAST /LATEST TICK]" if was_fast else "[5M GE BASELINE TICK]"
+    print(f"OSRS DUMP VULNERABILITY SCORE (DVS) SCANNER v{VERSION} {mode_tag}".center(width))
     print("=" * width)
     header = (
-        f"{'Item Name':<24} | {'Dump Price':>10} | {'Exit (Cap)':>10} | "
+        f"{'Item Name':<24} | {'Age':>7} | {'Dump Price':>10} | {'Exit (Cap)':>10} | "
         f"{'Net ROI':>7} | {'DVS':>5} | {'Pillars (M/S/D)':>15} | "
         f"{'Est Fill':>8} | {'Est Profit':>13} | {'Status'}"
     )
@@ -626,27 +887,34 @@ def print_report(
     print("-" * width)
 
     if not candidates:
-        print("No strict qualifying dumps found on this 5-minute tick.".center(width))
+        print("No strict qualifying dumps found on this tick.".center(width))
         if near_misses:
             print("-" * width)
-            print("TOP NEAR-MISS WATCHLIST (slightly below strict DVS / profit thresholds):".center(width))
+            print("TOP NEAR-MISS WATCHLIST (highlighting specific failure metric):".center(width))
             print("-" * width)
             for c in near_misses:
                 pillars = f"{c.m_score:.1f}/{c.s_score:.1f}/{c.d_score:.1f}"
                 profit_str = f"{c.est_profit:,} gp"
+                age_str = format_age(c.low_time, now)
+                fail_tag = f" [FAIL: {c.fail_reason}]" if c.fail_reason else ""
                 print(
-                    f"{c.name[:24]:<24} | {c.p_dump:>10,} | {c.p_exit:>10,} | "
+                    f"{c.name[:24]:<24} | {age_str:>7} | {c.p_dump:>10,} | {c.p_exit:>10,} | "
                     f"{c.net_roi_pct:>6.2f}% | {c.dvs:>5.1f} | {pillars:>15} | "
-                    f"{c.est_fill:>8,} | {profit_str:>13} | {c.status}"
+                    f"{c.est_fill:>8,} | {profit_str:>13} | {c.status}{fail_tag}"
                 )
     else:
         for c in candidates:
             pillars = f"{c.m_score:.1f}/{c.s_score:.1f}/{c.d_score:.1f}"
             profit_str = f"{c.est_profit:,} gp"
+            age_str = format_age(c.low_time, now)
             marker = " *NEW*" if new_ids and c.item_id in new_ids else ""
-            status_str = f"{c.status} [ALCH]" if c.alch_bonus > 0 else c.status
+            status_str = c.status
+            if c.alch_bonus > 0 and "[ALCH]" not in status_str:
+                status_str += " [ALCH]"
+            if c.decant_profit > 0 and "[DECANT]" not in status_str:
+                status_str += f" [DECANT +{c.decant_roi_pct:.1f}%]"
             print(
-                f"{c.name[:24]:<24} | {c.p_dump:>10,} | {c.p_exit:>10,} | "
+                f"{c.name[:24]:<24} | {age_str:>7} | {c.p_dump:>10,} | {c.p_exit:>10,} | "
                 f"{c.net_roi_pct:>6.2f}% | {c.dvs:>5.1f} | {pillars:>15} | "
                 f"{c.est_fill:>8,} | {profit_str:>13} | {status_str}{marker}"
             )
@@ -724,7 +992,7 @@ def log_candidates(candidates: List[DumpCandidate]) -> Optional[Path]:
 
 
 # =====================================================================
-# CLI
+# CLI & WATCH LOOPS
 # =====================================================================
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OSRS Dump Vulnerability Score (DVS) scanner")
@@ -737,6 +1005,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Use looser thresholds (DVS >= 45, Est Profit >= 40k, Drop >= 2.0%%) for slow market hours",
     )
     parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Enable fast-polling on /latest against cached 5m baseline",
+    )
+    parser.add_argument(
+        "--fast-interval",
+        type=int,
+        default=DEFAULT_FAST_INTERVAL_SECONDS,
+        help=f"Seconds between fast /latest polls in watch mode (default: {DEFAULT_FAST_INTERVAL_SECONDS}s)",
+    )
+    parser.add_argument(
+        "--filter-potions",
+        action="store_true",
+        help="Filter out non-4-dose potions ((1), (2), (3) dose potions)",
+    )
+    parser.add_argument(
+        "--no-decant",
+        action="store_true",
+        help="Disable decant arbitrage checks for partial-dose potions",
+    )
+    parser.add_argument(
         "--no-log", action="store_true", help="Do not append candidates to the CSV log"
     )
     parser.add_argument(
@@ -747,7 +1036,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--watch",
         action="store_true",
-        help="Re-scan after every 5-minute bucket boundary until interrupted (Ctrl+C)",
+        help="Run continuous two-speed hybrid loop (fast ticks on /latest, slow ticks on 5m GE rollover)",
     )
     parser.add_argument(
         "--clip",
@@ -781,31 +1070,45 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def seconds_until_next_bucket(now: Optional[float] = None) -> float:
+    now = time.time() if now is None else now
+    next_boundary = (math.floor(now / WATCH_BUCKET_SECONDS) + 1) * WATCH_BUCKET_SECONDS
+    return max(1.0, next_boundary + SLOW_TICK_BOUNDARY_DELAY - now)
+
+
 def run_scan_once(
-    session: requests.Session,
+    engine: MarketScannerEngine,
     args: argparse.Namespace,
     previous_ids: Optional[Set[int]] = None,
+    fast_mode: bool = False,
 ) -> Optional[List[DumpCandidate]]:
     min_dvs = 45.0 if getattr(args, "relaxed", False) else MIN_DVS_SCORE
     min_profit = 40_000 if getattr(args, "relaxed", False) else MIN_EST_PROFIT
     min_drop = 2.0 if getattr(args, "relaxed", False) else MIN_RAW_DROP_PCT
     min_margin = 5.0 if getattr(args, "relaxed", False) else MIN_MARGIN_PILLAR
     min_price = getattr(args, "min_price", MIN_ITEM_PRICE)
-
     knife_check = KNIFE_CHECK_ENABLED and not args.no_knife_check
+    filter_potions = getattr(args, "filter_potions", False)
+    decant_check = not getattr(args, "no_decant", False)
+
     near_misses: List[DumpCandidate] = []
     try:
-        candidates, funnel = scan_dumps(
-            session,
+        candidates, near_misses, funnel, was_fast = engine.scan(
             knife_check_enabled=knife_check,
             max_slots=args.slots,
             bankroll=args.bankroll,
             near_misses_out=near_misses,
             min_dvs_score=min_dvs,
             min_margin_pillar=min_margin,
+            min_demand_pillar=MIN_DEMAND_PILLAR,
             min_est_profit=min_profit,
+            max_slot_capital=MAX_SLOT_CAPITAL,
             min_raw_drop_pct=min_drop,
+            min_support_break_pct=MIN_SUPPORT_BREAK_PCT,
             min_item_price=min_price,
+            filter_partial_potions=filter_potions,
+            decant_check=decant_check,
+            fast_mode=fast_mode,
         )
     except requests.RequestException as exc:
         print(f"Network error while querying the OSRS Wiki API: {exc}", file=sys.stderr)
@@ -814,7 +1117,7 @@ def run_scan_once(
     current_ids = {c.item_id for c in candidates}
     new_ids = (current_ids - previous_ids) if previous_ids is not None else None
 
-    print_report(candidates, new_ids, near_misses=near_misses)
+    print_report(candidates, new_ids, near_misses=near_misses, was_fast=was_fast)
     if not args.no_log:
         logged = log_candidates(candidates)
         if logged:
@@ -830,54 +1133,54 @@ def run_scan_once(
     if args.debug:
         print_funnel(funnel)
     elif not candidates:
-        print("Tip: run with --relaxed for looser filters, or --watch to scan every 5m tick automatically.")
+        print("Tip: run with --relaxed for looser filters, or --watch for the hybrid fast-polling loop.")
 
     if new_ids:
-        strong_new = [c for c in candidates if c.item_id in new_ids and c.status == "STRONG BUY"]
+        strong_new = [c for c in candidates if c.item_id in new_ids and c.status.startswith("STRONG BUY")]
         names = ", ".join(c.name for c in candidates if c.item_id in new_ids)
         print(f"NEW since last scan: {names}")
         if strong_new:
             print("\a", end="", flush=True)
             if args.webhook_url:
-                send_webhook_alert(session, args.webhook_url, strong_new)
+                send_webhook_alert(engine.session, args.webhook_url, strong_new)
     elif previous_ids is None and args.webhook_url:
-        strong_initial = [c for c in candidates if c.status == "STRONG BUY"]
+        strong_initial = [c for c in candidates if c.status.startswith("STRONG BUY")]
         if strong_initial:
-            send_webhook_alert(session, args.webhook_url, strong_initial)
+            send_webhook_alert(engine.session, args.webhook_url, strong_initial)
 
     return candidates
 
 
-def seconds_until_next_bucket(now: Optional[float] = None) -> float:
-    now = time.time() if now is None else now
-    next_boundary = (math.floor(now / WATCH_BUCKET_SECONDS) + 1) * WATCH_BUCKET_SECONDS
-    return max(1.0, next_boundary + WATCH_BOUNDARY_DELAY_SECONDS - now)
-
-
-def watch_loop(session: requests.Session, args: argparse.Namespace) -> int:
+def watch_loop(engine: MarketScannerEngine, args: argparse.Namespace) -> int:
     previous_ids: Optional[Set[int]] = None
+    fast_interval = max(10, getattr(args, "fast_interval", DEFAULT_FAST_INTERVAL_SECONDS))
     print(
-        f"Watch mode: scanning now, then {WATCH_BOUNDARY_DELAY_SECONDS}s after each "
-        f"5-minute boundary. Press Ctrl+C to stop."
+        f"Hybrid Watch Mode: Slow loop refreshes baseline every 5m tick (+{SLOW_TICK_BOUNDARY_DELAY}s delay).\n"
+        f"Fast loop polls /latest every {fast_interval}s for real-time market panic. Press Ctrl+C to stop."
     )
     while True:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{stamp}] Scanning...")
-        candidates = run_scan_once(session, args, previous_ids)
+        is_stale = engine.is_baseline_stale()
+        mode_str = "Slow Baseline Refresh" if is_stale else "Fast /latest Poll"
+        print(f"\n[{stamp}] [{mode_str}] Scanning...")
+        start_t = time.time()
+        candidates = run_scan_once(engine, args, previous_ids, fast_mode=True)
+        elapsed = time.time() - start_t
         if candidates is not None:
             previous_ids = {c.item_id for c in candidates}
-        wait = seconds_until_next_bucket()
-        print(f"Next scan in {int(wait)}s.")
-        time.sleep(wait)
+        next_5m = int(seconds_until_next_bucket())
+        print(f"Scan completed in {elapsed:.2f}s. Next fast poll in {fast_interval}s (Next 5m GE tick in {next_5m}s).")
+        time.sleep(fast_interval)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     session = build_session()
+    engine = MarketScannerEngine(session)
     try:
         if args.watch:
-            return watch_loop(session, args)
-        result = run_scan_once(session, args)
+            return watch_loop(engine, args)
+        result = run_scan_once(engine, args, fast_mode=args.fast)
         return 0 if result is not None else 1
     except KeyboardInterrupt:
         print("\nStopped by user.", file=sys.stderr)

@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-OSRS DVS Dump Scanner Web Dashboard
-===================================
+OSRS DVS Dump Scanner Web Dashboard v2.7-hybrid
+===============================================
 A real-time web application serving an interactive dark-mode dashboard
 for finding GE dumps and analyzing backtests.
+
+Features:
+- Two-Speed Hybrid Polling Engine: 30-45s fast polls on /latest + 5m synced baseline refreshes
+- Live "Dump Age" (AGE) column with real-time second-by-second ticker
+- Specific metric failure cell highlighting for Near-Miss Watchlist
+- Total Capital Outlay (Dump Price x Est Fill) alongside Est Fill
+- Partial-Dose Potion Filtering & Decant Arbitrage Analysis
+- Interactive Backtester & Rejection Funnel Analytics
 
 Powered by Python's built-in http.server.ThreadingHTTPServer.
 Default URL: http://127.0.0.1:8080
@@ -48,6 +56,9 @@ spec.loader.exec_module(dvs_scanner)
 
 # Import dvs_backtest
 import dvs_backtest  # noqa: E402
+
+# Shared stateful MarketScannerEngine
+ENGINE = dvs_scanner.MarketScannerEngine()
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -114,11 +125,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       box-shadow: 0 0 15px rgba(34, 197, 94, 0.2);
     }
     .badge-pulse {
-      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      animation: pulse 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
     }
     @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: .5; }
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: .65; transform: scale(0.97); }
     }
   </style>
 </head>
@@ -134,17 +145,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div>
           <div class="flex items-center space-x-2">
             <h1 class="font-extrabold text-lg text-white tracking-tight">OSRS DVS Scanner</h1>
-            <span class="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono font-semibold">v2.7</span>
+            <span class="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono font-semibold">v2.7-hybrid</span>
           </div>
-          <p class="text-xs text-slate-400">Grand Exchange Dump Vulnerability & Bounce Engine</p>
+          <p class="text-xs text-slate-400">Two-Speed Real-Time Dump Detection & Arbitrage Engine</p>
         </div>
       </div>
 
       <!-- Live Tick & Auto-Watch Status -->
-      <div class="flex items-center space-x-4">
-        <div class="hidden sm:flex flex-col text-right">
-          <span class="text-xs text-slate-400">Next GE 5m Tick in</span>
-          <span id="countdown-timer" class="font-mono text-sm font-bold text-amber-400">--:--</span>
+      <div class="flex items-center space-x-3 sm:space-x-4">
+        <!-- Scan Mode Badge -->
+        <span id="scan-mode-badge" class="hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+          ⚡ Fast Mode (/latest)
+        </span>
+
+        <div class="hidden md:flex flex-col text-right">
+          <span class="text-[11px] text-slate-400">GE 5m Rollover</span>
+          <span id="countdown-timer" class="font-mono text-xs font-bold text-amber-400">--:--</span>
+        </div>
+
+        <div class="flex flex-col text-right">
+          <span class="text-[11px] text-slate-400">Fast Poll (30s)</span>
+          <span id="fast-timer" class="font-mono text-xs font-bold text-cyan-400">30s</span>
         </div>
         
         <button id="btn-autowatch" onclick="toggleAutoWatch()" class="flex items-center space-x-2 px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-xs font-semibold transition">
@@ -156,13 +177,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <span id="audio-icon">🔔</span>
         </button>
 
-        <button id="btn-scan" onclick="runScan()" class="flex items-center space-x-2 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs uppercase tracking-wider transition shadow-lg shadow-amber-500/20 active:scale-95">
-          <svg id="scan-spinner" class="animate-spin -ml-0.5 mr-2 h-4 w-4 text-slate-950 hidden" fill="none" viewBox="0 0 24 24">
-            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
-          </svg>
-          <span id="scan-btn-text">Scan Now</span>
-        </button>
+        <div class="flex items-center space-x-1">
+          <button id="btn-scan" onclick="runScan(false)" class="flex items-center space-x-2 px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs uppercase tracking-wider transition shadow-lg shadow-amber-500/20 active:scale-95">
+            <svg id="scan-spinner" class="animate-spin -ml-0.5 mr-1.5 h-3.5 w-3.5 text-slate-950 hidden" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+            </svg>
+            <span id="scan-btn-text">Scan Now</span>
+          </button>
+          <button onclick="runScan(true)" title="Force full slow baseline refresh (fetches all endpoints)" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs transition">
+            🔄
+          </button>
+        </div>
       </div>
     </div>
   </header>
@@ -171,27 +197,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="border-b border-osrs-border bg-slate-900/50 p-4">
     <div class="max-w-7xl mx-auto">
       <div class="flex flex-wrap items-center justify-between gap-4">
-        <!-- Relaxed Mode Toggle & Preset Presets -->
-        <div class="flex items-center space-x-4">
-          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-2 rounded-lg border border-slate-700 hover:border-slate-600 transition">
+        <!-- Toggles -->
+        <div class="flex flex-wrap items-center gap-3">
+          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-600 transition">
             <input type="checkbox" id="check-relaxed" onchange="onRelaxedChanged()" class="w-4 h-4 rounded text-amber-500 focus:ring-amber-400 focus:ring-offset-slate-900 bg-slate-900 border-slate-700">
             <span class="text-xs font-semibold text-slate-200">Relaxed Mode</span>
-            <span class="text-[10px] text-amber-400/80 font-mono">(DVS 45, Profit 40k)</span>
+            <span class="text-[10px] text-amber-400/80 font-mono">(DVS 45, 40k)</span>
           </label>
 
-          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-2 rounded-lg border border-slate-700 hover:border-slate-600 transition">
+          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-600 transition" title="Filter non-4-dose potions like (3) or (2) doses">
+            <input type="checkbox" id="check-filter-potions" class="w-4 h-4 rounded text-amber-500 focus:ring-amber-400 focus:ring-offset-slate-900 bg-slate-900 border-slate-700">
+            <span class="text-xs font-semibold text-slate-200">Filter (1)-(3) Potions</span>
+          </label>
+
+          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-600 transition" title="Calculate decant arbitrage into (4)-dose equivalents">
+            <input type="checkbox" id="check-decant" checked class="w-4 h-4 rounded text-amber-500 focus:ring-amber-400 focus:ring-offset-slate-900 bg-slate-900 border-slate-700">
+            <span class="text-xs font-semibold text-slate-200">Decant Arb Check</span>
+          </label>
+
+          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-600 transition">
             <input type="checkbox" id="check-knife" checked class="w-4 h-4 rounded text-amber-500 focus:ring-amber-400 focus:ring-offset-slate-900 bg-slate-900 border-slate-700">
             <span class="text-xs font-semibold text-slate-200">Knife Check</span>
           </label>
 
-          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-2 rounded-lg border border-slate-700 hover:border-slate-600 transition">
+          <label class="flex items-center space-x-2 cursor-pointer bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-slate-600 transition">
             <input type="checkbox" id="check-log" checked class="w-4 h-4 rounded text-amber-500 focus:ring-amber-400 focus:ring-offset-slate-900 bg-slate-900 border-slate-700">
             <span class="text-xs font-semibold text-slate-200">Log Signals</span>
           </label>
         </div>
 
         <!-- Numeric Parameters -->
-        <div class="flex flex-wrap items-center gap-3">
+        <div class="flex flex-wrap items-center gap-2.5">
           <div class="flex items-center space-x-1.5 bg-slate-800/60 px-2.5 py-1.5 rounded-lg border border-slate-700">
             <span class="text-[11px] text-slate-400">Min DVS</span>
             <input type="number" id="input-min-dvs" value="55" step="1" min="10" max="100" class="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs font-mono text-center text-amber-300">
@@ -231,7 +267,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Navigation Tabs -->
   <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4 w-full">
     <div class="flex border-b border-osrs-border space-x-6 text-sm font-medium">
-      <button id="tab-btn-live" onclick="switchTab('live')" class="pb-3 border-b-2 border-amber-500 text-amber-400 flex items-center space-x-2 transition">
+      <button id="tab-btn-live" onclick="switchTab('live')" class="pb-3 border-b-2 border-amber-500 text-amber-400 flex items-center space-x-2 transition font-bold">
         <span>⚡ Live Opportunities</span>
         <span id="badge-count" class="px-2 py-0.5 text-xs rounded-full bg-amber-500/20 text-amber-300 font-mono">0</span>
       </button>
@@ -267,7 +303,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
 
         <div class="bg-osrs-card border border-osrs-border p-4 rounded-xl shadow-sm">
-          <p class="text-xs text-slate-400">Allocated Capital</p>
+          <p class="text-xs text-slate-400">Total Capital Outlay</p>
           <div class="mt-1">
             <span id="kpi-capital" class="text-2xl font-extrabold text-slate-200 font-mono">0 gp</span>
           </div>
@@ -285,7 +321,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <!-- Opportunities Table Card -->
       <div class="bg-osrs-card border border-osrs-border rounded-xl shadow overflow-hidden">
         <div class="px-5 py-4 border-b border-osrs-border flex items-center justify-between">
-          <h2 class="font-bold text-sm text-white tracking-wide uppercase">Primary Dump Signals</h2>
+          <div class="flex items-center space-x-3">
+            <h2 class="font-bold text-sm text-white tracking-wide uppercase">Primary Dump Signals</h2>
+            <span class="text-[11px] text-slate-400 font-sans">(Real-time DVS >= threshold)</span>
+          </div>
           <span id="scan-timestamp" class="text-xs text-slate-500 font-mono">Last scanned: Never</span>
         </div>
 
@@ -294,12 +333,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <thead>
               <tr class="border-b border-osrs-border bg-slate-900/60 text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
                 <th class="py-3 px-4 cursor-pointer hover:text-white" onclick="sortTable('name')">Item Name</th>
+                <th class="py-3 px-3 text-center cursor-pointer hover:text-white" onclick="sortTable('low_time')">Dump Age</th>
                 <th class="py-3 px-3 text-right cursor-pointer hover:text-white" onclick="sortTable('p_dump')">Dump Price</th>
                 <th class="py-3 px-3 text-right cursor-pointer hover:text-white" onclick="sortTable('p_exit')">Exit Target</th>
                 <th class="py-3 px-3 text-right cursor-pointer hover:text-white" onclick="sortTable('net_roi_pct')">Net ROI</th>
                 <th class="py-3 px-3 text-right cursor-pointer hover:text-white" onclick="sortTable('dvs')">DVS</th>
                 <th class="py-3 px-3 text-center">Pillars (M/S/D)</th>
-                <th class="py-3 px-3 text-right cursor-pointer hover:text-white" onclick="sortTable('est_fill')">Est Fill</th>
+                <th class="py-3 px-3 text-right cursor-pointer hover:text-white" onclick="sortTable('est_fill')">Est Fill / Outlay</th>
                 <th class="py-3 px-4 text-right cursor-pointer hover:text-white" onclick="sortTable('est_profit')">Est Profit</th>
                 <th class="py-3 px-3 text-center">Status</th>
                 <th class="py-3 px-4 text-center">Action</th>
@@ -307,7 +347,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </thead>
             <tbody id="opportunities-tbody" class="divide-y divide-osrs-border font-mono text-slate-200">
               <tr>
-                <td colspan="10" class="py-8 text-center text-slate-500 font-sans">
+                <td colspan="11" class="py-8 text-center text-slate-500 font-sans">
                   Click <strong>Scan Now</strong> to fetch live dumps from the OSRS Wiki API.
                 </td>
               </tr>
@@ -322,7 +362,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="flex items-center space-x-2">
             <span class="text-amber-400 text-sm">⚠️</span>
             <h3 class="font-bold text-xs uppercase tracking-wider text-amber-300">Top Near-Miss Watchlist</h3>
-            <span class="text-[11px] text-slate-400 font-sans">(Passed baseline & tax, slightly below strict score/profit thresholds)</span>
+            <span class="text-[11px] text-slate-400 font-sans">(Passed baseline & tax, specific failure metric highlighted below)</span>
           </div>
           <span class="text-xs text-slate-500 font-mono">Top 5</span>
         </div>
@@ -332,12 +372,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <thead>
               <tr class="border-b border-osrs-border bg-slate-900/60 text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
                 <th class="py-2.5 px-4">Item Name</th>
+                <th class="py-2.5 px-3 text-center">Dump Age</th>
                 <th class="py-2.5 px-3 text-right">Dump Price</th>
                 <th class="py-2.5 px-3 text-right">Exit Target</th>
                 <th class="py-2.5 px-3 text-right">Net ROI</th>
                 <th class="py-2.5 px-3 text-right">DVS</th>
                 <th class="py-2.5 px-3 text-center">Pillars (M/S/D)</th>
-                <th class="py-2.5 px-3 text-right">Est Fill</th>
+                <th class="py-2.5 px-3 text-right">Est Fill / Outlay</th>
                 <th class="py-2.5 px-4 text-right">Est Profit</th>
                 <th class="py-2.5 px-3 text-center">Status</th>
                 <th class="py-2.5 px-4 text-center">Action</th>
@@ -345,7 +386,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </thead>
             <tbody id="nearmiss-tbody" class="divide-y divide-osrs-border font-mono text-slate-300">
               <tr>
-                <td colspan="10" class="py-6 text-center text-slate-500 font-sans">No near misses to show yet.</td>
+                <td colspan="11" class="py-6 text-center text-slate-500 font-sans">No near misses to show yet.</td>
               </tr>
             </tbody>
           </table>
@@ -357,7 +398,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <section id="tab-funnel" class="space-y-6 hidden">
       <div class="bg-osrs-card border border-osrs-border rounded-xl p-6 shadow">
         <h2 class="font-bold text-base text-white mb-2">Rejection Funnel Analytics</h2>
-        <p class="text-xs text-slate-400 mb-6">Real-time inspection of why items were rejected during the scan pass.</p>
+        <p class="text-xs text-slate-400 mb-6">Real-time inspection of why items were filtered out during the scan pass.</p>
 
         <div id="funnel-container" class="space-y-3">
           <p class="text-slate-500 text-xs">Run a scan first to populate funnel analytics.</p>
@@ -427,11 +468,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let sortAsc = false;
     let autoWatchActive = false;
     let audioAlerts = true;
-    let countdownInterval = null;
     let nextBucketSeconds = 0;
     let targetCountdownTime = 0;
+    let fastSecondsRemaining = 30;
     let knownSignalIds = new Set();
     let audioCtx = null;
+    let isFastScanMode = true;
+
+    // Formatting Helpers
+    function formatAgeBadge(lowTime) {
+      if (!lowTime || lowTime <= 0) {
+        return '<span class="text-slate-500 font-mono text-[10px]">--</span>';
+      }
+      const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - lowTime));
+      if (ageSec < 60) {
+        return `<span class="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 badge-pulse">${ageSec}s ago</span>`;
+      } else if (ageSec < 180) {
+        const m = Math.floor(ageSec / 60);
+        const s = ageSec % 60;
+        return `<span class="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">${m}m ${s}s ago</span>`;
+      } else {
+        const m = Math.floor(ageSec / 60);
+        return `<span class="px-2 py-0.5 rounded-full text-[10px] font-mono text-slate-400 bg-slate-800 border border-slate-700">${m}m ago</span>`;
+      }
+    }
 
     // Audio Chime via Web Audio API
     function playChime() {
@@ -444,7 +504,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           audioCtx.resume();
         }
         const now = audioCtx.currentTime;
-        // Two-tone rising chime (OSRS style ping)
         const osc1 = audioCtx.createOscillator();
         const osc2 = audioCtx.createOscillator();
         const gain = audioCtx.createGain();
@@ -492,7 +551,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       setTimeout(() => {
         toast.classList.remove('opacity-100');
         toast.classList.add('opacity-0');
-      }, 2000);
+      }, 2200);
     }
 
     function copyItemName(name, event) {
@@ -541,13 +600,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       if (autoWatchActive) {
         dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 badge-pulse';
-        text.textContent = 'Auto-Watch: On';
+        text.textContent = 'Auto-Watch: On (30s)';
         btn.classList.add('border-emerald-500/50', 'bg-emerald-950/30', 'text-emerald-300');
-        showToast('Auto-watch activated: scanning on bucket boundaries');
-        // If countdown expired or unset, scan now
-        if (nextBucketSeconds <= 0) {
-          runScan();
-        }
+        showToast('Hybrid Auto-Watch active: polling /latest every 30s');
+        fastSecondsRemaining = 30;
       } else {
         dot.className = 'w-2.5 h-2.5 rounded-full bg-slate-500';
         text.textContent = 'Auto-Watch: Off';
@@ -556,31 +612,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    function startCountdown(seconds) {
-      nextBucketSeconds = Math.max(1, Math.round(seconds));
-      targetCountdownTime = Date.now() + nextBucketSeconds * 1000;
-      if (countdownInterval) clearInterval(countdownInterval);
+    // 1-Second Master Ticker: updates live countdowns & Dump Age cells
+    setInterval(() => {
+      // 1. GE 5m Rollover Countdown
+      const remaining5m = Math.max(0, Math.round((targetCountdownTime - Date.now()) / 1000));
+      const m = Math.floor(remaining5m / 60);
+      const s = remaining5m % 60;
+      document.getElementById('countdown-timer').textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
 
-      countdownInterval = setInterval(() => {
-        const remaining = Math.max(0, Math.round((targetCountdownTime - Date.now()) / 1000));
-        const m = Math.floor(remaining / 60);
-        const s = remaining % 60;
-        document.getElementById('countdown-timer').textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
-
-        if (remaining <= 0) {
-          clearInterval(countdownInterval);
-          if (autoWatchActive) {
-            runScan();
-          }
+      // 2. Fast Poll Countdown
+      if (autoWatchActive) {
+        fastSecondsRemaining = Math.max(0, fastSecondsRemaining - 1);
+        document.getElementById('fast-timer').textContent = `${fastSecondsRemaining}s`;
+        if (fastSecondsRemaining <= 0) {
+          fastSecondsRemaining = 30;
+          runScan(false);
         }
-      }, 1000);
-    }
+      } else {
+        document.getElementById('fast-timer').textContent = '30s';
+      }
 
-    async function runScan() {
+      // 3. Dynamic Relative Age Badges in DOM
+      document.querySelectorAll('.dump-age-cell').forEach(cell => {
+        const ts = parseInt(cell.getAttribute('data-lowtime'), 10);
+        cell.innerHTML = formatAgeBadge(ts);
+      });
+    }, 1000);
+
+    async function runScan(forceSlow = false) {
       const spinner = document.getElementById('scan-spinner');
       const btnText = document.getElementById('scan-btn-text');
       spinner.classList.remove('hidden');
-      btnText.textContent = 'Scanning...';
+      btnText.textContent = forceSlow ? 'Refreshing...' : 'Scanning...';
 
       const minDvs = document.getElementById('input-min-dvs').value;
       const minProfit = document.getElementById('input-min-profit').value;
@@ -589,6 +652,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const bankroll = document.getElementById('input-bankroll').value;
       const retrace = document.getElementById('input-retrace').value;
       const relaxed = document.getElementById('check-relaxed').checked;
+      const filterPotions = document.getElementById('check-filter-potions').checked;
+      const decantCheck = document.getElementById('check-decant').checked;
       const knife = document.getElementById('check-knife').checked;
       const log = document.getElementById('check-log').checked;
 
@@ -598,8 +663,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         min_price: minPrice,
         retrace: retrace,
         relaxed: relaxed ? '1' : '0',
+        potion_filter: filterPotions ? '1' : '0',
+        decant_check: decantCheck ? '1' : '0',
         knife_check: knife ? '1' : '0',
-        log: log ? '1' : '0'
+        log: log ? '1' : '0',
+        fast: forceSlow ? '0' : '1',
+        force_slow: forceSlow ? '1' : '0'
       });
       if (slots) params.append('slots', slots);
       if (bankroll) params.append('bankroll', bankroll);
@@ -612,9 +681,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         currentCandidates = data.candidates || [];
         currentNearMisses = data.near_misses || [];
         currentFunnel = data.funnel || {};
+        isFastScanMode = data.is_fast_scan !== false;
+
+        const badge = document.getElementById('scan-mode-badge');
+        if (isFastScanMode) {
+          badge.textContent = '⚡ Fast Mode (/latest)';
+          badge.className = 'hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/30';
+        } else {
+          badge.textContent = '🔄 5m GE Baseline Refresh';
+          badge.className = 'hidden sm:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono bg-amber-500/20 text-amber-300 border border-amber-500/30';
+        }
 
         document.getElementById('scan-timestamp').textContent = 'Last scanned: ' + new Date().toLocaleTimeString();
-        startCountdown(data.next_bucket_wait_sec || 300);
+        targetCountdownTime = Date.now() + (data.next_bucket_wait_sec || 300) * 1000;
+        fastSecondsRemaining = 30;
 
         // Check for new STRONG BUY
         let hasNewStrong = false;
@@ -689,10 +769,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (count === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="10" class="py-8 text-center text-slate-400 font-sans">
+            <td colspan="11" class="py-8 text-center text-slate-400 font-sans">
               <div class="max-w-md mx-auto space-y-2">
                 <p class="font-medium text-slate-300">No strict qualifying dumps found on this tick.</p>
-                <p class="text-xs text-slate-500">Market conditions are quiet or dumps did not break support. Check the <strong>Near-Miss Watchlist</strong> below, or toggle <strong>Relaxed Mode</strong>.</p>
+                <p class="text-xs text-slate-500">Market conditions are quiet or dumps did not break support. Check the <strong>Near-Miss Watchlist</strong> below with highlighted failure metrics, or toggle <strong>Relaxed Mode</strong>.</p>
               </div>
             </td>
           </tr>
@@ -705,20 +785,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const isStrong = c.status.includes('STRONG BUY');
           const statusClass = isStrong ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold' : 'bg-amber-500/20 text-amber-300 border border-amber-500/40';
           const alchBadge = c.alch_bonus > 0 ? `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40">ALCH</span>` : '';
+          
+          let potionBadge = '';
+          if (c.is_potion && c.potion_dose) {
+            potionBadge += `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40" title="${c.potion_dose}-dose potion">(${c.potion_dose})</span>`;
+          }
+          if (c.decant_profit > 0) {
+            potionBadge += `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono" title="Decant into ${c.decant_target_name} for +${c.decant_roi_pct}% ROI (${c.decant_profit.toLocaleString()} gp profit)">🧪 Decant +${c.decant_roi_pct}%</span>`;
+          }
+
+          const capitalOutlay = (c.p_dump * c.est_fill).toLocaleString();
 
           row.innerHTML = `
-            <td class="py-3 px-4 font-sans font-semibold text-white flex items-center space-x-2">
+            <td class="py-3 px-4 font-sans font-semibold text-white flex items-center space-x-1.5 flex-wrap">
               <a href="https://prices.runescape.wiki/osrs/item/${c.item_id}" target="_blank" rel="noopener" class="hover:text-amber-400 transition hover:underline" title="View live OSRS Wiki page">
                 ${c.name}
               </a>
               ${alchBadge}
+              ${potionBadge}
+            </td>
+            <td class="py-3 px-3 text-center dump-age-cell" data-lowtime="${c.low_time}">
+              ${formatAgeBadge(c.low_time)}
             </td>
             <td class="py-3 px-3 text-right text-slate-200">${c.p_dump.toLocaleString()}</td>
             <td class="py-3 px-3 text-right text-slate-400">${c.p_exit.toLocaleString()}</td>
             <td class="py-3 px-3 text-right text-emerald-400 font-bold">+${c.net_roi_pct.toFixed(2)}%</td>
             <td class="py-3 px-3 text-right font-extrabold ${c.dvs >= 75 ? 'text-emerald-400' : 'text-amber-400'}">${c.dvs.toFixed(1)}</td>
             <td class="py-3 px-3 text-center text-xs text-slate-400">${c.m_score.toFixed(1)} / ${c.s_score.toFixed(1)} / ${c.d_score.toFixed(1)}</td>
-            <td class="py-3 px-3 text-right text-slate-300">${c.est_fill.toLocaleString()}</td>
+            <td class="py-3 px-3 text-right">
+              <span class="text-slate-200 font-mono font-semibold">${c.est_fill.toLocaleString()}</span>
+              <span class="block text-[10px] text-slate-400 font-mono">${capitalOutlay} gp</span>
+            </td>
             <td class="py-3 px-4 text-right font-bold text-emerald-300">${c.est_profit.toLocaleString()} gp</td>
             <td class="py-3 px-3 text-center">
               <span class="inline-block text-[10px] px-2 py-0.5 rounded-full ${statusClass}">${c.status}</span>
@@ -733,28 +830,68 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         });
       }
 
-      // Render Near Misses Table
+      // Render Near Misses Table with Specific Cell Failure Highlighting
       const nmBody = document.getElementById('nearmiss-tbody');
       nmBody.innerHTML = '';
       if (currentNearMisses.length === 0) {
-        nmBody.innerHTML = `<tr><td colspan="10" class="py-4 text-center text-slate-500 font-sans">No near misses on this tick.</td></tr>`;
+        nmBody.innerHTML = `<tr><td colspan="11" class="py-4 text-center text-slate-500 font-sans">No near misses on this tick.</td></tr>`;
       } else {
+        const minDvsVal = parseFloat(document.getElementById('input-min-dvs').value) || 55;
+        const minProfitVal = parseInt(document.getElementById('input-min-profit').value, 10) || 80000;
+
         currentNearMisses.forEach(c => {
           const row = document.createElement('tr');
           row.className = 'hover:bg-slate-800/40 transition border-b border-osrs-border/30';
+
+          const failReason = c.fail_reason || '';
+          const isMarginFail = failReason === 'MARGIN';
+          const isDemandFail = failReason === 'DEMAND';
+          const isDvsFail = failReason === 'DVS';
+          const isProfitFail = failReason === 'PROFIT';
+
+          const capitalOutlay = (c.p_dump * c.est_fill).toLocaleString();
+
+          let potionBadge = '';
+          if (c.is_potion && c.potion_dose) {
+            potionBadge += `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">(${c.potion_dose})</span>`;
+          }
+          if (c.decant_profit > 0) {
+            potionBadge += `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono">🧪 Decant +${c.decant_roi_pct}%</span>`;
+          }
+
+          // Metric cells with failure badge/tinting
+          const dvsCellHtml = isDvsFail
+            ? `<div class="inline-flex items-center px-1.5 py-0.5 rounded bg-rose-950/70 border border-rose-500/70 text-rose-300 font-bold"><span class="mr-1">${c.dvs.toFixed(1)}</span><span class="text-[9px] px-1 py-0.2 rounded bg-rose-500/30 text-rose-200 font-mono">&lt;${minDvsVal}</span></div>`
+            : `<span class="text-amber-300 font-bold">${c.dvs.toFixed(1)}</span>`;
+
+          const pillarsCellHtml = (isMarginFail || isDemandFail)
+            ? `<div class="inline-flex items-center px-1.5 py-0.5 rounded bg-rose-950/70 border border-rose-500/70 text-rose-300 font-bold"><span class="mr-1">${c.m_score.toFixed(1)}/${c.s_score.toFixed(1)}/${c.d_score.toFixed(1)}</span><span class="text-[9px] px-1 py-0.2 rounded bg-rose-500/30 text-rose-200 font-mono">${isMarginFail ? 'M < 8.0' : 'D < 5.0'}</span></div>`
+            : `<span class="text-slate-400">${c.m_score.toFixed(1)} / ${c.s_score.toFixed(1)} / ${c.d_score.toFixed(1)}</span>`;
+
+          const profitCellHtml = isProfitFail
+            ? `<div class="inline-flex items-center px-1.5 py-0.5 rounded bg-rose-950/70 border border-rose-500/70 text-rose-300 font-bold"><span class="mr-1">${c.est_profit.toLocaleString()} gp</span><span class="text-[9px] px-1 py-0.2 rounded bg-rose-500/30 text-rose-200 font-mono">&lt;${Math.round(minProfitVal/1000)}k</span></div>`
+            : `<span class="text-amber-300 font-semibold">${c.est_profit.toLocaleString()} gp</span>`;
+
           row.innerHTML = `
-            <td class="py-2.5 px-4 font-sans text-slate-200">
+            <td class="py-2.5 px-4 font-sans text-slate-200 flex items-center space-x-1.5 flex-wrap">
               <a href="https://prices.runescape.wiki/osrs/item/${c.item_id}" target="_blank" rel="noopener" class="hover:text-amber-400 transition hover:underline">
                 ${c.name}
               </a>
+              ${potionBadge}
+            </td>
+            <td class="py-2.5 px-3 text-center dump-age-cell" data-lowtime="${c.low_time}">
+              ${formatAgeBadge(c.low_time)}
             </td>
             <td class="py-2.5 px-3 text-right text-slate-300">${c.p_dump.toLocaleString()}</td>
             <td class="py-2.5 px-3 text-right text-slate-400">${c.p_exit.toLocaleString()}</td>
             <td class="py-2.5 px-3 text-right text-emerald-400">+${c.net_roi_pct.toFixed(2)}%</td>
-            <td class="py-2.5 px-3 text-right text-amber-300 font-bold">${c.dvs.toFixed(1)}</td>
-            <td class="py-2.5 px-3 text-center text-slate-400">${c.m_score.toFixed(1)} / ${c.s_score.toFixed(1)} / ${c.d_score.toFixed(1)}</td>
-            <td class="py-2.5 px-3 text-right text-slate-300">${c.est_fill.toLocaleString()}</td>
-            <td class="py-2.5 px-4 text-right text-amber-300 font-semibold">${c.est_profit.toLocaleString()} gp</td>
+            <td class="py-2.5 px-3 text-right">${dvsCellHtml}</td>
+            <td class="py-2.5 px-3 text-center text-xs">${pillarsCellHtml}</td>
+            <td class="py-2.5 px-3 text-right">
+              <span class="text-slate-200 font-mono">${c.est_fill.toLocaleString()}</span>
+              <span class="block text-[10px] text-slate-400 font-mono">${capitalOutlay} gp</span>
+            </td>
+            <td class="py-2.5 px-4 text-right">${profitCellHtml}</td>
             <td class="py-2.5 px-3 text-center">
               <span class="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">NEAR MISS</span>
             </td>
@@ -943,9 +1080,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       container.innerHTML = html;
     }
 
-    // Initial page load: trigger first scan automatically
+    // Initial page load: trigger first fast scan
     window.addEventListener('DOMContentLoaded', () => {
-      runScan();
+      runScan(false);
     });
   </script>
 </body>
@@ -1012,41 +1149,46 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
                 knife_check = qs.get("knife_check", ["1"])[0].lower() in ("1", "true", "yes")
                 log_enabled = qs.get("log", ["1"])[0].lower() in ("1", "true", "yes")
+                fast_mode = qs.get("fast", ["1"])[0].lower() in ("1", "true", "yes")
+                force_slow = qs.get("force_slow", ["0"])[0].lower() in ("1", "true", "yes")
+                filter_potions = qs.get("potion_filter", ["0"])[0].lower() in ("1", "true", "yes")
+                decant_check = qs.get("decant_check", ["1"])[0].lower() in ("1", "true", "yes")
 
-                session = dvs_scanner.build_session()
                 near_misses: List[Any] = []
-                try:
-                    candidates, funnel = dvs_scanner.scan_dumps(
-                        session,
-                        knife_check_enabled=knife_check,
-                        max_slots=slots,
-                        bankroll=bankroll,
-                        near_misses_out=near_misses,
-                        min_dvs_score=min_dvs,
-                        min_margin_pillar=default_margin,
-                        min_demand_pillar=dvs_scanner.MIN_DEMAND_PILLAR,
-                        min_est_profit=min_profit,
-                        max_slot_capital=max_capital,
-                        min_raw_drop_pct=default_drop,
-                        min_support_break_pct=dvs_scanner.MIN_SUPPORT_BREAK_PCT,
-                        min_item_price=min_price,
-                        retracement_target=retrace,
-                        max_recovery_fraction=dvs_scanner.MAX_RECOVERY_FRACTION,
-                    )
-                finally:
-                    session.close()
+                candidates, near_misses, funnel, was_fast = ENGINE.scan(
+                    knife_check_enabled=knife_check,
+                    max_slots=slots,
+                    bankroll=bankroll,
+                    near_misses_out=near_misses,
+                    min_dvs_score=min_dvs,
+                    min_margin_pillar=default_margin,
+                    min_demand_pillar=dvs_scanner.MIN_DEMAND_PILLAR,
+                    min_est_profit=min_profit,
+                    max_slot_capital=max_capital,
+                    min_raw_drop_pct=default_drop,
+                    min_support_break_pct=dvs_scanner.MIN_SUPPORT_BREAK_PCT,
+                    min_item_price=min_price,
+                    retracement_target=retrace,
+                    max_recovery_fraction=dvs_scanner.MAX_RECOVERY_FRACTION,
+                    filter_partial_potions=filter_potions,
+                    decant_check=decant_check,
+                    force_slow=force_slow,
+                    fast_mode=fast_mode,
+                )
 
                 if log_enabled and candidates:
                     dvs_scanner.log_candidates(candidates)
 
-                wait_sec = dvs_scanner.seconds_until_next_bucket()
+                wait_5m = dvs_scanner.seconds_until_next_bucket()
                 response = {
                     "status": "success",
                     "scan_time": datetime.now(timezone.utc).isoformat(),
+                    "is_fast_scan": was_fast,
                     "candidates": [asdict(c) for c in candidates],
                     "near_misses": [asdict(c) for c in near_misses],
                     "funnel": dict(funnel),
-                    "next_bucket_wait_sec": wait_sec,
+                    "next_bucket_wait_sec": wait_5m,
+                    "next_fast_wait_sec": 30,
                 }
                 self.send_json_response(response)
             except Exception as exc:
@@ -1093,10 +1235,11 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
     server_address = (host, port)
     httpd = ThreadingHTTPServer(server_address, DashboardRequestHandler)
     print("=" * 70)
-    print(f"OSRS DVS SCANNER & BACKTESTER WEB DASHBOARD v2.7".center(70))
+    print("OSRS DVS SCANNER & BACKTESTER WEB DASHBOARD v2.7-hybrid".center(70))
     print("=" * 70)
     print(f"Dashboard running at: http://{host}:{port}/")
-    print(f"Serving API endpoints: /api/scan, /api/backtest")
+    print("Serving API endpoints: /api/scan, /api/backtest")
+    print("Fast loop polling: every 30s | Slow baseline rollover: every 5m")
     print("Press Ctrl+C to terminate the web server.")
     print("=" * 70)
     try:
