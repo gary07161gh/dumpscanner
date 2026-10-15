@@ -1,0 +1,26 @@
+[MAIN]
+# Ignore the stale release bundle and virtual environments
+ignore=misc,.venv
+
+[MESSAGES CONTROL]
+# Disable convention and refactoring messages to focus on errors and high-priority warnings
+disable=
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    too-many-lines,
+    too-many-locals,
+    too-many-branches,
+    too-many-statements,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-instance-attributes,
+    line-too-long,
+    duplicate-code,
+    invalid-name,
+    no-else-return,
+    consider-using-in,
+    wrong-import-position
+
+[FORMAT]
+max-line-length=120

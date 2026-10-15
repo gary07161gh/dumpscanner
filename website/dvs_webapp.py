@@ -19,19 +19,14 @@ Default URL: http://127.0.0.1:8080
 import argparse
 import importlib.util
 import json
-import math
-import os
 import sys
 import threading
-import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List
 from urllib.parse import parse_qs, urlparse
-
-import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -1194,7 +1189,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "next_fast_wait_sec": 30,
                 }
                 self.send_json_response(response)
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
                 self.send_json_response({"status": "error", "message": str(exc)}, status_code=500)
             return
 
@@ -1224,7 +1219,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     volume_fills=volume_fills,
                 )
                 self.send_json_response({"status": "success", "data": results})
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
                 self.send_json_response({"status": "error", "message": str(exc)}, status_code=500)
             return
 

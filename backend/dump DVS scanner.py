@@ -22,7 +22,7 @@ from urllib3.util.retry import Retry
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         pass
 
 VERSION = "2.7-hybrid"
@@ -203,7 +203,7 @@ def _log_transient_error(endpoint: str, kind: str, detail: str) -> None:
     """Append one ERROR- entry to .learnings/ERRORS.md on a given
     (endpoint, kind) combination. De-duplicates within the process so a watch
     loop does not flood the log with one row per poll."""
-    global _error_seq
+    global _error_seq  # pylint: disable=global-statement
     signature = (endpoint, kind)
     if signature in _logged_transient_errors:
         return
@@ -277,7 +277,7 @@ def fetch_endpoint(
             if attempt < max_retries:
                 time.sleep(min(2 ** (attempt - 1), 5))
                 continue
-            raise last_exc
+            raise last_exc from exc
 
         body = _safe_json(resp)
 
@@ -404,7 +404,7 @@ def get_pre_dump_baseline_and_support(
     else:
         prior_low = high_1h if high_1h > 0 else low_1h
 
-    if high_1h > 0 and prior_low > high_1h:
+    if 0 < high_1h < prior_low:
         prior_low = high_1h
 
     if buy_1h > 0 and prior_sell_vol > 0 and high_1h > 0:
@@ -976,7 +976,7 @@ DEFAULT_ENGINE: Optional[MarketScannerEngine] = None
 
 
 def get_default_engine(session: Optional[requests.Session] = None) -> MarketScannerEngine:
-    global DEFAULT_ENGINE
+    global DEFAULT_ENGINE  # pylint: disable=global-statement
     if DEFAULT_ENGINE is None or (session and DEFAULT_ENGINE.session != session):
         DEFAULT_ENGINE = MarketScannerEngine(session)
     return DEFAULT_ENGINE
@@ -1343,7 +1343,6 @@ def run_scan_once(
 
     if args.debug:
         if args.json:
-            import json
             print(json.dumps(dict(funnel)))
         else:
             print_funnel(funnel)

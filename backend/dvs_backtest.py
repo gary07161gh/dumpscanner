@@ -468,7 +468,9 @@ def print_target_sweep(
         total = sum(o.realized_profit for o in filled)
         marker = "  <- current" if current_target is not None and abs(retrace - current_target) < 1e-9 else ""
         print(f"{retrace:>7.2f} | {len(filled):>7} | {hit_rate:>6.1f}% | {avg_roi:>+7.2f}% | {total:>14,}{marker}")
-        if best is None or total > best[1]:
+        if best is None:
+            best = (retrace, total)
+        elif total > best[1]:
             best = (retrace, total)
     if best:
         print(f"Highest total profit in this sample: target {best[0]:.2f}")
@@ -489,8 +491,8 @@ def export_outcomes(path: Path, outcomes: List[Outcome]) -> None:
 def parse_horizons(raw: str) -> List[int]:
     try:
         horizons = sorted({int(part) for part in raw.split(",") if part.strip()})
-    except ValueError:
-        raise argparse.ArgumentTypeError("horizons must be comma-separated integers (minutes)")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("horizons must be comma-separated integers (minutes)") from exc
     if not horizons or any(h <= 0 for h in horizons):
         raise argparse.ArgumentTypeError("horizons must be positive integers (minutes)")
     return horizons
