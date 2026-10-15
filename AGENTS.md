@@ -1,23 +1,63 @@
 # Project Conventions & Agent Guide
 
-## Architecture Overview
-- **Backend Core**: [dump DVS scanner.py](file:///c:/Users/Gary0/Downloads/dump%20finder/backend/dump%20DVS%20scanner.py)
-  - Stateful `MarketScannerEngine` maintains the two-speed hybrid polling engine:
-    - **Slow Loop**: Refreshes baseline (`/mapping`, `/5m`, `/1h`, `/24h`) every 300s (synced ~12s after GE boundary).
-    - **Fast Loop**: Evaluates `/latest` in ~150ms against the cached 5m baseline denominators.
-  - Timeseries falling knife check (`KNIFE_CHECK_ENABLED`) runs only on finalists crossing the DVS and profit threshold.
-- **Backtesting Engine**: [dvs_backtest.py](file:///c:/Users/Gary0/Downloads/dump%20finder/backend/dvs_backtest.py)
-  - Reads [dvs_candidate_log.csv](file:///c:/Users/Gary0/Downloads/dump%20finder/backend/dvs_candidate_log.csv) and evaluates real historical hit rates, drawdowns, and target sweeps.
-- **Web Dashboard**: [dvs_webapp.py](file:///c:/Users/Gary0/Downloads/dump%20finder/website/dvs_webapp.py)
-  - Built-in `ThreadingHTTPServer` on port 8080.
-  - Serves single-page dark-mode dashboard with real-time 1s client ticker for Dump Age, failure cell tinting for near misses, and potion decanting badges.
+Flat Python scripts for an OSRS Grand Exchange dump scanner. No packaging, no tests, no CI, no README.
 
-## Critical Technical Conventions
-1. **Windows Console Encoding**:
-   - Always include `if hasattr(sys.stdout, "reconfigure"): sys.stdout.reconfigure(encoding="utf-8", errors="replace")` at the entry point of scripts that print table reports to prevent `cp1252` encoding crashes on emojis or unicode characters.
-2. **Fast-Loop Active Candidate Retention**:
-   - In `/latest` fast polling, never skip items blindly based on `lowTime == last_seen`. Always retain and re-evaluate `prev_active_ids` so active opportunities stay in the UI until they recover or collapse.
-3. **CSV Schema & Backtest Compatibility**:
-   - When modifying `DumpCandidate` fields, preserve the core columns required by `dvs_backtest.py` (`timestamp_unix`, `item_id`, `name`, `p_dump`, `p_exit`, `p_base`, `est_fill`, `dvs`, `status`). Additional fields must have default values.
-4. **Decant Arbitrage Rules**:
-   - Bob Barter at the Grand Exchange decants doses for free. Buying (1), (2), or (3) dose potions and selling as (4) dose is tax-exempt on purchase, with GE 2% tax applied only on exit of the (4)-dose potion.
+## Commands
+
+Only third-party dep is `requests` (urllib3 comes with it). There is **no `requirements.txt`**.
+
+```bash
+python "backend/dump DVS scanner.py" --debug          # one-shot scan + rejection funnel
+python "backend/dump DVS scanner.py" --relaxed         # loose thresholds for quiet hours
+python "backend/dump DVS scanner.py" --watch           # continuous two-speed loop (30s fast polls)
+python backend/dvs_backtest.py --horizons 15,30,60 --volume-fills --out results.csv
+python website/dvs_webapp.py --port 8080               # dashboard; also serves /api/scan, /api/backtest
+```
+
+- Quote the scanner path — the filename contains spaces and is **not** importable by name.
+- Alerts: set `DVS_WEBHOOK_URL` (Discord) or pass `--webhook-url`; only fires on new `STRONG BUY`.
+- `--no-log` suppresses CSV writes. Logging is **on by default**, including in the dashboard.
+- Verification is running the CLI with `--debug` and reading the funnel. `.vscode/settings.json` points
+  unittest at `*test.py`, but **no test files exist** — don't assume a suite is available.
+
+## Data paths
+
+All paths derive from `Path(__file__).resolve().parent`, so the scripts in `backend/` own:
+`backend/dvs_candidate_log.csv`, `backend/dvs_mapping_cache.json`, `backend/timeseries_cache/`.
+Stale duplicates of those three also sit at the **repo root** — nothing in the current layout reads them.
+
+## Gotchas
+
+- **Adding/reordering a `DumpCandidate` field silently archives the signal log.** `log_candidates()`
+  compares the header to the current field list and, on mismatch, renames the existing CSV to
+  `dvs_candidate_log.<unix_ts>.old.csv`. Your history is not merged or preserved. Keep the columns
+  `dvs_backtest.py` requires (`timestamp_unix`, `item_id`, `name`, `p_dump`, `p_exit`, `p_base`,
+  `est_fill`, `dvs`, `status`) and give any new field a default.
+- **The webapp loads the scanner via `importlib` from `../backend`** (falling back to its own dir) and
+  inserts `backend/` on `sys.path` for `import dvs_backtest`. Renaming or relocating the scanner breaks
+  the dashboard; renaming it to something importable changes nothing else.
+- **Keep the stdout reconfigure at module import scope in the scanner, not inside `main()`.**
+  `dvs_backtest.py` and `dvs_webapp.py` have no guard of their own — the webapp only gets UTF-8 stdout
+  as a side effect of importing the scanner. Without it, `cp1252` crashes on non-ASCII output.
+- **Fast-loop item retention:** `/latest` ticks skip items whose `lowTime` hasn't changed *unless* they
+  are in `prev_active_ids` (the previous scan's candidates + near-misses). Also note
+  `last_evaluated_low_times` is cleared on every baseline refresh, so each slow tick re-evaluates
+  everything. Don't "optimize" this by skipping on `lowTime` equality alone — active rows vanish from
+  the dashboard until they fully recover.
+- **`ENGINE` in the webapp is a module-global shared across `ThreadingHTTPServer` threads with no lock.**
+  Concurrent `/api/scan` calls interleave mutation of the engine's cached baseline and skip-state.
+  Don't add a second engine or assume per-request isolation.
+- **`--relaxed` relaxes exactly four things** (DVS 45, profit 40k, drop 2.0%, margin pillar 5.0). The
+  demand pillar, support-break pct, and min price stay fixed.
+- **Backtest silently drops incomplete signals.** Rows whose horizon hasn't fully elapsed are excluded
+  and counted in `excluded`, so recent logs look sparse by design, not broken.
+- **Decant economics:** buying (1)/(2)/(3)-dose potions and selling the combined (4)-dose is
+  tax-exempt on purchase; the 2% GE tax applies only on selling the (4)-dose. Don't apply
+  `calculate_ge_tax()` to the buy side of a decant.
+
+## Stale directories
+
+`misc/` is a v2.5 release snapshot, not source. `misc/bundle_project.py` embeds **pre-2.7 copies** of
+the scanner and backtest (no `MarketScannerEngine`, `get_pre_dump_baseline` without `_and_support`),
+writes them into `misc/`, then zips that folder to `misc/dump_finder_v2.5.zip`. Don't edit or run it
+expecting it to package current code, and don't trust a `grep` hit there over `backend/`.
