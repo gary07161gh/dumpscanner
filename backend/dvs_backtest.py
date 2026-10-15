@@ -94,6 +94,7 @@ class Outcome:
 
 
 def calculate_ge_tax(sell_price: int) -> int:
+    """Calculates exact OSRS GE 2% tax (exempt under 50 gp, capped at 5M gp)."""
     if sell_price < 50:
         return 0
     return min(int(math.floor(sell_price * 0.02)), 5_000_000)

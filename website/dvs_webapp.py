@@ -22,6 +22,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -59,6 +60,7 @@ import dvs_backtest  # noqa: E402
 
 # Shared stateful MarketScannerEngine
 ENGINE = dvs_scanner.MarketScannerEngine()
+ENGINE_LOCK = threading.Lock()
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -1155,26 +1157,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 decant_check = qs.get("decant_check", ["1"])[0].lower() in ("1", "true", "yes")
 
                 near_misses: List[Any] = []
-                candidates, near_misses, funnel, was_fast = ENGINE.scan(
-                    knife_check_enabled=knife_check,
-                    max_slots=slots,
-                    bankroll=bankroll,
-                    near_misses_out=near_misses,
-                    min_dvs_score=min_dvs,
-                    min_margin_pillar=default_margin,
-                    min_demand_pillar=dvs_scanner.MIN_DEMAND_PILLAR,
-                    min_est_profit=min_profit,
-                    max_slot_capital=max_capital,
-                    min_raw_drop_pct=default_drop,
-                    min_support_break_pct=dvs_scanner.MIN_SUPPORT_BREAK_PCT,
-                    min_item_price=min_price,
-                    retracement_target=retrace,
-                    max_recovery_fraction=dvs_scanner.MAX_RECOVERY_FRACTION,
-                    filter_partial_potions=filter_potions,
-                    decant_check=decant_check,
-                    force_slow=force_slow,
-                    fast_mode=fast_mode,
-                )
+                with ENGINE_LOCK:
+                    candidates, near_misses, funnel, was_fast = ENGINE.scan(
+                        knife_check_enabled=knife_check,
+                        max_slots=slots,
+                        bankroll=bankroll,
+                        near_misses_out=near_misses,
+                        min_dvs_score=min_dvs,
+                        min_margin_pillar=default_margin,
+                        min_demand_pillar=dvs_scanner.MIN_DEMAND_PILLAR,
+                        min_est_profit=min_profit,
+                        max_slot_capital=max_capital,
+                        min_raw_drop_pct=default_drop,
+                        min_support_break_pct=dvs_scanner.MIN_SUPPORT_BREAK_PCT,
+                        min_item_price=min_price,
+                        retracement_target=retrace,
+                        max_recovery_fraction=dvs_scanner.MAX_RECOVERY_FRACTION,
+                        filter_partial_potions=filter_potions,
+                        decant_check=decant_check,
+                        force_slow=force_slow,
+                        fast_mode=fast_mode,
+                    )
 
                 if log_enabled and candidates:
                     dvs_scanner.log_candidates(candidates)

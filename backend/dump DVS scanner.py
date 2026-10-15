@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -606,6 +607,7 @@ class MarketScannerEngine:
         self.cached_candidates: List[DumpCandidate] = []
         self.cached_near_misses: List[DumpCandidate] = []
         self.cached_funnel: CounterType[str] = Counter()
+        self._lock = threading.Lock()
 
     def is_baseline_stale(self, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else now
@@ -1206,6 +1208,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--debug", action="store_true", help="Print the rejection funnel showing why items were filtered"
     )
     parser.add_argument(
+        "--json", action="store_true", help="Output the rejection funnel as JSON for machine parsing"
+    )
+    parser.add_argument(
         "--relaxed",
         action="store_true",
         help="Use looser thresholds (DVS >= 45, Est Profit >= 40k, Drop >= 2.0%%) for slow market hours",
@@ -1337,7 +1342,11 @@ def run_scan_once(
             print("Warning: no supported clipboard utility found.", file=sys.stderr)
 
     if args.debug:
-        print_funnel(funnel)
+        if args.json:
+            import json
+            print(json.dumps(dict(funnel)))
+        else:
+            print_funnel(funnel)
     elif not candidates:
         print("Tip: run with --relaxed for looser filters, or --watch for the hybrid fast-polling loop.")
 
